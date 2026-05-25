@@ -1,0 +1,196 @@
+{
+  "tables": [
+    {
+      "id": "1",
+      "name": "Aircraft Configuration",
+      "description": "Aircraft seating configurations",
+      "rows": 6,
+      "fields": [
+        {
+          "id": "f1",
+          "name": "%Aircraft Configuration ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Unique aircraft configuration identifier"
+        },
+        {
+          "id": "f2",
+          "name": "Aircraft Configuration",
+          "isKey": false,
+          "type": "text",
+          "description": "Configuration type"
+        }
+      ]
+    },
+    {
+      "id": "2",
+      "name": "AllData",
+      "description": "Main fact table with flight data",
+      "rows": 1256075,
+      "fields": [
+        {
+          "id": "f3",
+          "name": "%Aircraft Configuration ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Link to Aircraft Configuration"
+        },
+        {
+          "id": "f4",
+          "name": "%Airline ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Link to Airlines dimension"
+        },
+        {
+          "id": "f5",
+          "name": "%Aircraft Type ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Link to Aircraft Types dimension"
+        },
+        {
+          "id": "f6",
+          "name": "%Origin Airport ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Link to Origin Airports dimension"
+        },
+        {
+          "id": "f7",
+          "name": "# Departures Scheduled",
+          "isKey": false,
+          "type": "numeric",
+          "description": "Number of scheduled departures"
+        },
+        {
+          "id": "f8",
+          "name": "# Transported Passengers",
+          "isKey": false,
+          "type": "numeric",
+          "description": "Number of passengers transported"
+        }
+      ]
+    },
+    {
+      "id": "3",
+      "name": "Aircraft Types",
+      "description": "Aircraft type dimension",
+      "rows": 379,
+      "fields": [
+        {
+          "id": "f9",
+          "name": "%Aircraft Type ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Unique aircraft type identifier"
+        },
+        {
+          "id": "f10",
+          "name": "Aircraft Type",
+          "isKey": false,
+          "type": "text",
+          "description": "Aircraft type name"
+        }
+      ]
+    },
+    {
+      "id": "4",
+      "name": "Airlines",
+      "description": "Airline dimension",
+      "rows": 1548,
+      "fields": [
+        {
+          "id": "f11",
+          "name": "%Airline ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Unique airline identifier"
+        },
+        {
+          "id": "f12",
+          "name": "Airline",
+          "isKey": false,
+          "type": "text",
+          "description": "Airline name"
+        }
+      ]
+    },
+    {
+      "id": "5",
+      "name": "Origin Airports",
+      "description": "Origin airport dimension",
+      "rows": 6209,
+      "fields": [
+        {
+          "id": "f13",
+          "name": "%Origin Airport ID",
+          "isKey": true,
+          "type": "numeric",
+          "description": "Unique origin airport identifier"
+        },
+        {
+          "id": "f14",
+          "name": "Origin Airport",
+          "isKey": false,
+          "type": "text",
+          "description": "Airport name"
+        }
+      ]
+    }
+  ],
+  "associations": [
+    {
+      "id": "a1",
+      "fromTableId": "1",
+      "toTableId": "2",
+      "fromFieldId": "f1",
+      "toFieldId": "f3",
+      "fromTable": "Aircraft Configuration",
+      "toTable": "AllData",
+      "fromFieldName": "%Aircraft Configuration ID",
+      "toFieldName": "%Aircraft Configuration ID",
+      "relationship": "one-to-many",
+      "description": "Aircraft configurations in flight records"
+    },
+    {
+      "id": "a2",
+      "fromTableId": "3",
+      "toTableId": "2",
+      "fromFieldId": "f9",
+      "toFieldId": "f5",
+      "fromTable": "Aircraft Types",
+      "toTable": "AllData",
+      "fromFieldName": "%Aircraft Type ID",
+      "toFieldName": "%Aircraft Type ID",
+      "relationship": "one-to-many",
+      "description": "Aircraft types in flight records"
+    },
+    {
+      "id": "a3",
+      "fromTableId": "4",
+      "toTableId": "2",
+      "fromFieldId": "f11",
+      "toFieldId": "f4",
+      "fromTable": "Airlines",
+      "toTable": "AllData",
+      "fromFieldName": "%Airline ID",
+      "toFieldName": "%Airline ID",
+      "relationship": "one-to-many",
+      "description": "Airlines in flight records"
+    },
+    {
+      "id": "a4",
+      "fromTableId": "5",
+      "toTableId": "2",
+      "fromFieldId": "f13",
+      "toFieldId": "f6",
+      "fromTable": "Origin Airports",
+      "toTable": "AllData",
+      "fromFieldName": "%Origin Airport ID",
+      "toFieldName": "%Origin Airport ID",
+      "relationship": "one-to-many",
+      "description": "Origin airports in flight records"
+    }
+  ]
+}

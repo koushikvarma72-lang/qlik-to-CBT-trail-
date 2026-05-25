@@ -1,0 +1,40 @@
+{
+  "name": "Airline Operations",
+  "description": "Airline flight data analysis application",
+  "createdDate": "2012-07-20T01:16:37Z",
+  "modifiedDate": "2024-04-22T00:00:00Z",
+  "version": "1.0.0",
+  "author": "Qlik Book Author",
+  "tables": [
+    {
+      "name": "Aircraft Configuration",
+      "description": "Seating configurations",
+      "rows": 6,
+      "columns": 2
+    },
+    {
+      "name": "AllData",
+      "description": "Main flight fact table",
+      "rows": 1256075,
+      "columns": 44
+    },
+    {
+      "name": "Aircraft Types",
+      "description": "Aircraft types",
+      "rows": 379,
+      "columns": 2
+    },
+    {
+      "name": "Airlines",
+      "description": "Airline companies",
+      "rows": 1548,
+      "columns": 2
+    },
+    {
+      "name": "Origin Airports",
+      "description": "Origin airports",
+      "rows": 6209,
+      "columns": 2
+    }
+  ]
+}

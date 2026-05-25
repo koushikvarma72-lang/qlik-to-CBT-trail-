@@ -1,0 +1,63 @@
+// ========================================
+// AIRLINE OPERATIONS QlikView Script
+// ========================================
+// This script loads airline operational data
+// Data source: Airline industry reports
+
+// ========================================
+// Load Aircraft Configuration Dimension
+// ========================================
+[Aircraft Configuration]:
+LOAD 
+    [%Aircraft Configuration ID],
+    [Aircraft Configuration]
+FROM [..\Data Files\QVDs\Aircraft Configuration.qvd] (qvd);
+
+// ========================================
+// Load Main Flight Data (Fact Table)
+// ========================================
+[AllData]:
+LOAD 
+    [%Aircraft Configuration ID],
+    [%Airline ID],
+    [%Aircraft Type ID],
+    [%Origin Airport ID],
+    [# Departures Scheduled],
+    [# Transported Passengers],
+    [Distance],
+    [Year],
+    [Month]
+FROM [..\Data Files\QVDs\Flight Data.qvd] (qvd);
+
+// ========================================
+// Load Aircraft Types Dimension
+// ========================================
+[Aircraft Types]:
+LOAD 
+    [%Aircraft Type ID],
+    [Aircraft Type]
+FROM [..\Data Files\QVDs\Aircraft Types.qvd] (qvd);
+
+// ========================================
+// Load Airlines Dimension
+// ========================================
+[Airlines]:
+LOAD 
+    [%Airline ID],
+    [Airline]
+FROM [..\Data Files\QVDs\Airlines.qvd] (qvd);
+
+// ========================================
+// Load Origin Airports Dimension
+// ========================================
+[Origin Airports]:
+LOAD 
+    [%Origin Airport ID],
+    [Origin Airport]
+FROM [..\Data Files\QVDs\Origin Airports.qvd] (qvd);
+
+// ========================================
+// End of Script
+// ========================================
+// Tables are automatically linked by matching field names
+// All % prefixed fields are key fields used for joining
