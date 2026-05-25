@@ -257,6 +257,124 @@ def _pass_security(sql: str) -> List[ValidationIssue]:
     return issues
 
 
+# ─── Pass 6 — Qlik-specific semantic checks ───────────────────────────────────
+
+# Text-to-number comparison: a text column compared to a numeric literal
+# Matches both quoted ("AccountDesc") and unquoted (AccountDesc) forms.
+_TEXT_NUMERIC_CMP = re.compile(
+    r'(?:"([A-Za-z_][A-Za-z0-9_]*(?:Desc|Name|Label|Code|Text|Title|Category|Type|Status))"'
+    r'|([A-Za-z_][A-Za-z0-9_]*(?:Desc|Name|Label|Code|Text|Title|Category|Type|Status))\b)'
+    r'\s*(?:>|<|>=|<=|=|!=|<>)\s*\d+\b',
+    re.IGNORECASE,
+)
+
+# YYYYMM passed raw to a date function without the required TO_DATE cast.
+# Strategy: find date-function calls containing YYYYMM, then filter out
+# cases where YYYYMM is already wrapped in TO_DATE(...) or is a format string.
+_YYYYMM_DATE_FN_CALL = re.compile(
+    r'\b(DATEADD|DATE_TRUNC|DATEDIFF|MONTHS_BETWEEN|ADD_MONTHS)\s*\(([^)]+)\)',
+    re.IGNORECASE,
+)
+_YYYYMM_BARE = re.compile(r'\bYYYYMM\b(?!\s*::)(?!\s*,\s*[\'"])', re.IGNORECASE)
+
+# SELECT * in a non-final position (inside a CTE body, not the last SELECT)
+_SELECT_STAR_IN_CTE = re.compile(r'\bAS\s*\(\s*SELECT\s*\*', re.IGNORECASE)
+
+# Common source-data typos that should be flagged for manual review
+_KNOWN_TYPOS = [
+    ('expeensebudget', 'expensebudget'),
+    ('expensebudegt', 'expensebudget'),
+    ('calander', 'calendar'),
+    ('custommer', 'customer'),
+    ('prodcut', 'product'),
+]
+
+
+def _pass_qlik_semantics(sql: str) -> List[ValidationIssue]:
+    """Qlik-migration-specific semantic checks."""
+    issues: List[ValidationIssue] = []
+
+    # 1. Text column compared to numeric literal
+    for m in _TEXT_NUMERIC_CMP.finditer(sql):
+        col = m.group(1) or m.group(2)  # group 1 = quoted form, group 2 = unquoted
+        line = sql[:m.start()].count('\n') + 1
+        issues.append(ValidationIssue(
+            'warning', 'TEXT_NUMERIC_COMPARISON',
+            f'Column "{col}" appears to be a text field but is compared to a numeric literal: {m.group().strip()!r}',
+            line=line,
+            suggestion=(
+                f'Replace with a NULL/empty check: '
+                f'"{col}" IS NOT NULL AND "{col}" != \'\' '
+                f'or TRY_CAST("{col}" AS INTEGER) > 0 if numeric content is expected.'
+            ),
+        ))
+
+    # 2. YYYYMM passed raw to a date function (not wrapped in TO_DATE)
+    for m in _YYYYMM_DATE_FN_CALL.finditer(sql):
+        fn_args = m.group(2)
+        # Check if YYYYMM appears bare (not inside TO_DATE(...) and not as a format string)
+        for ym in _YYYYMM_BARE.finditer(fn_args):
+            # Walk back in fn_args to see if TO_DATE( precedes this YYYYMM
+            preceding = fn_args[:ym.start()].upper()
+            if 'TO_DATE(' in preceding or 'TO_DATE (' in preceding:
+                continue  # safely wrapped
+            line = sql[:m.start()].count('\n') + 1
+            issues.append(ValidationIssue(
+                'error', 'YYYYMM_RAW_IN_DATE_FN',
+                f'YYYYMM passed directly to {m.group(1).upper()}() without TO_DATE cast: '
+                f'{m.group().strip()[:80]!r}',
+                line=line,
+                suggestion="Wrap YYYYMM with TO_DATE(YYYYMM::varchar, 'YYYYMM') before passing to date functions.",
+            ))
+            break  # one issue per function call is enough
+
+    # 3. SELECT * inside a CTE body (not the final SELECT)
+    for m in _SELECT_STAR_IN_CTE.finditer(sql):
+        line = sql[:m.start()].count('\n') + 1
+        issues.append(ValidationIssue(
+            'warning', 'SELECT_STAR_IN_CTE',
+            'SELECT * inside a CTE body — downstream consumers may break if source schema changes.',
+            line=line,
+            suggestion='Enumerate explicit column names in CTE SELECT lists.',
+        ))
+
+    # 4. Known source-data typos
+    sql_lower = sql.lower()
+    for typo, correction in _KNOWN_TYPOS:
+        if typo in sql_lower:
+            line = _find_line(sql, re.compile(re.escape(typo), re.IGNORECASE))
+            issues.append(ValidationIssue(
+                'warning', 'LIKELY_TYPO',
+                f'Possible typo "{typo}" found — did you mean "{correction}"?',
+                line=line,
+                suggestion=f'Check source table/column name: "{typo}" → "{correction}".',
+            ))
+
+    return issues
+
+
+# ─── Pass 7 — dbt model config ────────────────────────────────────────────────
+
+_DBT_CONFIG_BLOCK = re.compile(r'\{\{\s*config\s*\(', re.IGNORECASE)
+
+
+def _pass_dbt_config(sql: str, dialect: str) -> List[ValidationIssue]:
+    """Warn when a dbt model is missing a {{ config(...) }} block."""
+    issues: List[ValidationIssue] = []
+    if dialect.lower() not in ('dbt', 'snowflake', 'bigquery', 'databricks', 'redshift', 'postgres'):
+        return issues
+    if not _DBT_CONFIG_BLOCK.search(sql):
+        issues.append(ValidationIssue(
+            'info', 'MISSING_DBT_CONFIG',
+            'No {{ config(...) }} block found in the dbt model.',
+            suggestion=(
+                "Add a config block at the top, e.g.:\n"
+                "{{ config(materialized='table', tags=['migration']) }}"
+            ),
+        ))
+    return issues
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def validate_migration_sql(
@@ -283,6 +401,8 @@ def validate_migration_sql(
     all_issues.extend(_pass_ref_integrity(sql, known_staging_models))
     all_issues.extend(_pass_dialect(sql, dialect))
     all_issues.extend(_pass_security(sql))
+    all_issues.extend(_pass_qlik_semantics(sql))
+    all_issues.extend(_pass_dbt_config(sql, dialect))
 
     # Sort: errors first, then warnings, then info
     _order = {'error': 0, 'warning': 1, 'info': 2}

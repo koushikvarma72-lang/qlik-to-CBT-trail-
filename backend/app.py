@@ -30,6 +30,7 @@ from backend.advanced_qvf_extractor import extract_advanced_metadata
 from backend.sql_migration import (
     extract_sql_generation_plan,
     format_sql_generation_plan,
+    generate_dbt_config_block,
     hash_text,
     needs_sql_repair,
     normalize_sql_description,

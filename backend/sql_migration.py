@@ -194,32 +194,60 @@ def _safe_cte_name(name, fallback='load_block'):
     return value
 
 
+def generate_dbt_config_block(materialized='table', tags=None, cluster_by=None, dialect='dbt'):
+    """Return a {{ config(...) }} Jinja block for a dbt model.
+
+    Args:
+        materialized: 'table' | 'view' | 'incremental'
+        tags: list of string tags, defaults to ['qlik_migration']
+        cluster_by: optional list of columns for Snowflake/BigQuery clustering
+        dialect: used to decide whether to include warehouse-specific options
+    """
+    tags = tags or ['qlik_migration']
+    tag_str = ', '.join(f"'{t}'" for t in tags)
+    parts = [f"materialized='{materialized}'", f"tags=[{tag_str}]"]
+    if cluster_by and dialect.lower() in ('snowflake', 'bigquery', 'databricks'):
+        cols = ', '.join(f"'{c}'" for c in cluster_by)
+        parts.append(f'cluster_by=[{cols}]')
+    return '{{{{ config({}) }}}}'.format(', '.join(parts))
+
+
 def _translate_qlik_expression_to_sql(expression):
     expr = str(expression or '').strip()
     if not expr:
         return expr
 
+    # Step 1: convert [Field] brackets to "Field" double-quotes
     expr = re.sub(r'\[([^\]]+)\]', r'"\1"', expr)
+
+    # Step 2: translate Addmonths BEFORE Date() so Date(Addmonths(...)) resolves correctly
     expr = re.sub(
         r'Addmonths\s*\(\s*([^,]+?)\s*,\s*([^)]+?)\s*\)',
         r'DATEADD(month, \2, \1)',
         expr,
         flags=re.IGNORECASE,
     )
+
+    # Step 3: Date(expr, 'fmt') or Date(expr, "fmt") → TO_CHAR(expr, 'fmt')
     expr = re.sub(
-        r'Date\s*\(\s*(.+?)\s*,\s*\'([^\']+)\'\s*\)',
+        r'Date\s*\(\s*(.+?)\s*,\s*[\'"]([^\'"]+)[\'"]\s*\)',
         r"TO_CHAR(\1, '\2')",
         expr,
         flags=re.IGNORECASE | re.DOTALL,
     )
+    # Step 4: Date(expr) with no format → CAST(expr AS DATE)
     expr = re.sub(
         r'Date\s*\(\s*(.+?)\s*\)',
         r'CAST(\1 AS DATE)',
         expr,
         flags=re.IGNORECASE | re.DOTALL,
     )
+
+    # Step 5: string concatenation & → ||
     expr = expr.replace(' & ', ' || ')
     expr = re.sub(r'\s*&\s*', ' || ', expr)
+
+    # Step 6: aggregate function name mapping
     for qlik_func, sql_func in {
         'Sum': 'SUM',
         'Count': 'COUNT',
@@ -228,6 +256,30 @@ def _translate_qlik_expression_to_sql(expression):
         'Max': 'MAX',
     }.items():
         expr = re.sub(rf'\b{qlik_func}\s*\(', f'{sql_func}(', expr, flags=re.IGNORECASE)
+
+    # Step 7: fix text-column-vs-numeric comparisons that Qlik allows but SQL does not.
+    # Columns whose names end in Desc/Name/Label/Code/Text/Title/Category/Type/Status
+    # are almost certainly text fields — replace numeric comparisons with a
+    # proper NULL/empty check.
+    _text_col_eq_zero = re.compile(
+        r'"([A-Za-z_][A-Za-z0-9_]*(?:Desc|Name|Label|Code|Text|Title|Category|Type|Status))"\s*'
+        r'=\s*0\b',
+        re.IGNORECASE,
+    )
+    _text_col_cmp = re.compile(
+        r'"([A-Za-z_][A-Za-z0-9_]*(?:Desc|Name|Label|Code|Text|Title|Category|Type|Status))"\s*'
+        r'(?:>|<|>=|<=|!=|<>)\s*\d+\b',
+        re.IGNORECASE,
+    )
+    expr = _text_col_eq_zero.sub(
+        lambda m: f'("{m.group(1)}" IS NULL OR "{m.group(1)}" = \'\')',
+        expr,
+    )
+    expr = _text_col_cmp.sub(
+        lambda m: f'"{m.group(1)}" IS NOT NULL AND "{m.group(1)}" != \'\'',
+        expr,
+    )
+
     return expr
 
 
@@ -272,17 +324,49 @@ def _source_for_plan_item(item, cte_names):
     return _resolve_source_reference(source)
 
 
-def _render_select_for_plan_item(item, cte_names=None):
+def _extract_output_column_name(field_expression):
+    """Return the output column name (alias if present, else bare identifier)."""
+    _, alias = _split_alias_from_expression(field_expression)
+    if alias:
+        return _clean_qlik_field_name(alias)
+    # No alias — the expression itself is the column name if it's a plain identifier
+    expr = field_expression.strip().strip('[]"')
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
+        return expr
+    return None
+
+
+def _render_select_for_plan_item(item, cte_names=None, required_columns=None):
+    """Render a SELECT block for a single plan item.
+
+    Args:
+        item: plan item dict
+        cte_names: mapping of Qlik table names → CTE names
+        required_columns: when set (list of column names), pad any missing columns
+            with NULL AS "col_name" so UNION ALL branches are column-aligned.
+    """
     cte_names = cte_names or {}
     raw_fields = item.get('fields') or []
     rendered_fields = []
+    produced_columns = set()
+
     for field in raw_fields:
         expr, alias = _split_alias_from_expression(field)
         translated_expr = _translate_qlik_expression_to_sql(expr)
         if alias:
+            col_name = _clean_qlik_field_name(alias)
             rendered_fields.append(f"{translated_expr} AS {_format_sql_identifier(alias)}")
         else:
+            col_name = _extract_output_column_name(field)
             rendered_fields.append(translated_expr)
+        if col_name:
+            produced_columns.add(col_name.lower())
+
+    # Pad missing columns with NULL so UNION ALL branches stay column-aligned
+    if required_columns:
+        for col in required_columns:
+            if col.lower() not in produced_columns:
+                rendered_fields.append(f'NULL AS "{col}"')
 
     select_clause = 'SELECT\n    ' + ',\n    '.join(rendered_fields) if rendered_fields else 'SELECT *'
     source = _source_for_plan_item(item, cte_names)
@@ -304,32 +388,73 @@ def _render_select_for_plan_item(item, cte_names=None):
     return '\n'.join(block_lines)
 
 
+def _collect_all_output_columns(items):
+    """Return an ordered list of all unique output column names across a set of plan items.
+
+    Used to build the full column list for UNION ALL alignment — every branch must
+    produce the same columns in the same order, with NULL for missing ones.
+    """
+    seen = {}  # col_lower → original_name (preserves first-seen casing)
+    for item in items:
+        for field in item.get('fields') or []:
+            col = _extract_output_column_name(field)
+            if col and col.lower() not in seen:
+                seen[col.lower()] = col
+    return list(seen.values())
+
+
 def render_sql_from_load_plan(plan):
     """Render deterministic SQL directly from parsed LOAD blocks.
 
-    Handles CONCATENATE (→ UNION ALL), RESIDENT (→ CTE reference), and
-    picks the best final SELECT (fact table or last non-lookup CTE).
+    Handles:
+    - CONCATENATE → UNION ALL with NULL-padded column alignment (only the
+      columns explicitly loaded by the CONCATENATE branch are selected; all
+      other columns from the base table are padded with NULL).
+    - DROP FIELDS → split into two CTEs: <table>_pre_drop (full columns,
+      used in any UNION ALL) and <table> (post-drop projection).
+    - RESIDENT → CTE reference.
+    - Picks the best final SELECT (fact table or widest CTE).
     """
     if not plan:
         return ''
 
+    _CONFIG_BLOCK = "{{ config(materialized='table', tags=['qlik_migration']) }}"
+
     # ── Step 1: assign unique CTE names ──────────────────────────────────────
+    # DROP_FIELDS items don't get their own CTE — they modify an existing table's CTE.
+    # CONCATENATE items that share a table key with their base also don't get a new name.
+    # We assign names only to items that will actually produce a CTE.
     cte_names = {}
     used_names = set()
     for index, item in enumerate(plan, 1):
-        base_name = _safe_cte_name(item.get('table'), fallback=f'load_{index}')
+        if item.get('operation') == 'DROP_FIELDS':
+            continue  # no CTE of its own
+        table_key = item.get('table') or f'load_{index}'
+        if table_key in cte_names:
+            continue  # already assigned (e.g. second CONCATENATE into same table)
+        base_name = _safe_cte_name(table_key, fallback=f'load_{index}')
         cte_name = base_name
         counter = 2
         while cte_name in used_names:
             cte_name = f'{base_name}_{counter}'
             counter += 1
         used_names.add(cte_name)
-        cte_names[item.get('table') or f'load_{index}'] = cte_name
+        cte_names[table_key] = cte_name
 
-    if len(plan) == 1:
-        return _render_select_for_plan_item(plan[0], cte_names)
+    # ── Step 2: collect DROP FIELDS directives ────────────────────────────────
+    # drop_fields_map: table_key → list of column names to drop
+    drop_fields_map = {}
+    for item in plan:
+        if item.get('operation') == 'DROP_FIELDS' and item.get('table'):
+            table_key = item['table']
+            drop_fields_map.setdefault(table_key, []).extend(item.get('drop_fields') or [])
 
-    # ── Step 2: group CONCATENATE blocks into their target CTE ───────────────
+    # Early-return for a single effective LOAD item with no DROP FIELDS
+    non_drop_items = [i for i in plan if i.get('operation') != 'DROP_FIELDS']
+    if len(non_drop_items) == 1 and not drop_fields_map:
+        return _render_select_for_plan_item(non_drop_items[0], cte_names)
+
+    # ── Step 3: group CONCATENATE blocks into their target CTE ───────────────
     # Build a map: target_table → [base_item, concat_item1, concat_item2, ...]
     concat_groups = {}   # target_table_key → list of items to UNION ALL
     skip_indices = set() # indices that are absorbed into a CONCATENATE group
@@ -351,27 +476,86 @@ def render_sql_from_load_plan(plan):
                 concat_groups[target_key].append(item)
                 skip_indices.add(idx)
 
-    # ── Step 3: build CTE list ────────────────────────────────────────────────
+    # ── Step 4: build CTE list ────────────────────────────────────────────────
+    # We render in two passes:
+    #   A) CONCATENATE groups (keyed by target table) — these absorb all their members
+    #   B) Remaining non-absorbed, non-DROP_FIELDS items
+    # We need to preserve the original plan order, so we track which table_keys
+    # have already been emitted.
     ctes = []
+    emitted_table_keys = set()  # table_keys already rendered
+
     for index, item in enumerate(plan):
-        if index in skip_indices:
-            continue  # absorbed into a CONCATENATE group
+        if item.get('operation') == 'DROP_FIELDS':
+            continue  # handled via drop_fields_map, not as standalone CTEs
 
         table_key = item.get('table') or f'load_{index + 1}'
         cte_name = cte_names.get(table_key, f'load_{index + 1}')
+        dropped_cols = drop_fields_map.get(table_key, [])
+
+        # Skip items that were absorbed into a concat group AND already rendered
+        if index in skip_indices and table_key in emitted_table_keys:
+            continue
 
         if table_key in concat_groups:
-            # Render as UNION ALL of all members
-            union_parts = []
-            for member in concat_groups[table_key]:
-                union_parts.append(_render_select_for_plan_item(member, cte_names))
-            body = '\nUNION ALL\n'.join(union_parts)
+            if table_key in emitted_table_keys:
+                continue  # already rendered this group
+            emitted_table_keys.add(table_key)
+
+            # Collect the full column superset across all UNION ALL branches
+            all_members = concat_groups[table_key]
+            all_columns = _collect_all_output_columns(all_members)
+
+            if dropped_cols:
+                # Need a _pre_drop CTE (full columns) + post-drop CTE (surviving cols)
+                pre_drop_name = f'{cte_name}_pre_drop'
+                union_parts = [
+                    _render_select_for_plan_item(member, cte_names, required_columns=all_columns)
+                    for member in all_members
+                ]
+                body = '\nUNION ALL\n'.join(union_parts)
+                ctes.append(f'{pre_drop_name} AS (\n{body}\n)')
+
+                surviving = [c for c in all_columns if c not in dropped_cols]
+                if surviving:
+                    proj = ',\n    '.join(f'"{c}"' for c in surviving)
+                    drop_body = f'SELECT\n    {proj}\nFROM {pre_drop_name}'
+                else:
+                    drop_body = f'SELECT *\nFROM {pre_drop_name}'
+                ctes.append(f'{cte_name} AS (\n{drop_body}\n)')
+            else:
+                union_parts = [
+                    _render_select_for_plan_item(member, cte_names, required_columns=all_columns)
+                    for member in all_members
+                ]
+                body = '\nUNION ALL\n'.join(union_parts)
+                ctes.append(f'{cte_name} AS (\n{body}\n)')
+
+        elif index in skip_indices:
+            # Absorbed into a concat group that was already rendered — skip
+            continue
+
         else:
-            body = _render_select_for_plan_item(item, cte_names)
+            emitted_table_keys.add(table_key)
+            if dropped_cols:
+                # Simple table with DROP FIELDS — emit pre_drop + post_drop
+                pre_drop_name = f'{cte_name}_pre_drop'
+                body = _render_select_for_plan_item(item, cte_names)
+                ctes.append(f'{pre_drop_name} AS (\n{body}\n)')
 
-        ctes.append(f'{cte_name} AS (\n{body}\n)')
+                all_columns = _collect_all_output_columns([item])
+                surviving = [c for c in all_columns if c not in dropped_cols]
+                if surviving:
+                    proj = ',\n    '.join(f'"{c}"' for c in surviving)
+                    drop_body = f'SELECT\n    {proj}\nFROM {pre_drop_name}'
+                else:
+                    drop_body = f'SELECT *\nFROM {pre_drop_name}'
+                ctes.append(f'{cte_name} AS (\n{drop_body}\n)')
+            else:
+                body = _render_select_for_plan_item(item, cte_names)
+                ctes.append(f'{cte_name} AS (\n{body}\n)')
 
-    # ── Step 4: pick the best final SELECT ────────────────────────────────────
+    # ── Step 5: pick the best final SELECT ────────────────────────────────────
     # Prefer: a CTE whose name contains 'fact', then the largest CTE by field count,
     # then the last non-lookup CTE, then simply the last CTE.
     rendered_cte_names = [c.split(' AS (')[0].strip() for c in ctes]
@@ -384,6 +568,8 @@ def render_sql_from_load_plan(plan):
         best_idx = 0
         best_field_count = 0
         for i, item in enumerate(plan):
+            if item.get('operation') == 'DROP_FIELDS':
+                continue
             if (item.get('table') or f'load_{i+1}') in skip_indices:
                 continue
             fc = len(item.get('fields') or [])
@@ -391,13 +577,13 @@ def render_sql_from_load_plan(plan):
                 best_field_count = fc
                 best_idx = i
         best_table = plan[best_idx].get('table') or f'load_{best_idx + 1}'
-        final_cte = cte_names.get(best_table, rendered_cte_names[-1])
+        final_cte = cte_names.get(best_table, rendered_cte_names[-1] if rendered_cte_names else 'result')
 
-    return 'WITH\n' + ',\n'.join(ctes) + f'\nSELECT *\nFROM {final_cte}'
+    return f'{_CONFIG_BLOCK}\n\nWITH\n' + ',\n'.join(ctes) + f'\nSELECT *\nFROM {final_cte}'
 
 
 def extract_load_block_ast(qvs_script):
-    """Extract only LOAD-centric AST nodes from a decoded Qlik script."""
+    """Extract LOAD-centric and DROP FIELDS AST nodes from a decoded Qlik script."""
     parsed = parse_qlik_load_script(qvs_script or '')
     statements = parsed.get('statements', [])
     load_blocks = []
@@ -411,6 +597,32 @@ def extract_load_block_ast(qvs_script):
 
     for stmt in statements:
         stmt_type = stmt.get('type')
+
+        # Capture DROP FIELDS statements so the plan can apply them
+        if stmt_type == 'DROP_FIELDS':
+            _flush_chain()
+            raw_text = stmt.get('rawText') or stmt.get('content') or ''
+            # fields here are the columns being dropped; target is the table
+            dropped = [str(f).strip() for f in stmt.get('fields', []) if str(f).strip()]
+            target = _normalize_identifier(stmt.get('targetTable') or stmt.get('prefixTarget'))
+            if target and dropped:
+                load_blocks.append({
+                    'table': target,
+                    'operation': 'DROP_FIELDS',
+                    'fields': [],
+                    'drop_fields': dropped,
+                    'source': target,
+                    'sourceType': 'resident',
+                    'residentTable': target,
+                    'where': [],
+                    'joinType': None,
+                    'joinTarget': None,
+                    'prefix': None,
+                    'raw': raw_text,
+                    'lineNumber': stmt.get('lineNumber'),
+                })
+            continue
+
         if stmt_type != 'LOAD':
             _flush_chain()
             continue
@@ -421,6 +633,7 @@ def extract_load_block_ast(qvs_script):
             'table': _normalize_identifier(stmt.get('label') or stmt.get('prefixTarget') or stmt.get('table') or stmt.get('source') or f"load_{len(load_blocks) + 1}"),
             'operation': 'LOAD',
             'fields': fields,
+            'drop_fields': [],
             'source': stmt.get('source'),
             'sourceType': stmt.get('sourceType') or ('resident' if stmt.get('residentTable') else 'from'),
             'residentTable': stmt.get('residentTable'),
@@ -750,7 +963,7 @@ def extract_sql_generation_plan(qvs_script):
 
         plan.append({
             'table': block.get('table') or 'generated_sql',
-            'operation': 'LOAD',
+            'operation': block.get('operation', 'LOAD'),
             'source': block.get('source'),
             'source_tables': source_tables,
             'fields': block.get('fields', []),
@@ -761,6 +974,7 @@ def extract_sql_generation_plan(qvs_script):
             'raw': block.get('raw', ''),
             'is_concatenate': (block.get('joinType') or '').upper() == 'CONCATENATE',
             'concatenate_target': join_target if (block.get('joinType') or '').upper() == 'CONCATENATE' else None,
+            'drop_fields': block.get('drop_fields', []),
         })
 
     return plan
@@ -1949,6 +2163,22 @@ RULE 21 — YYYYMM TYPE PROPAGATION ACROSS CTEs
   Rule of thumb: only apply TO_DATE(YYYYMM::varchar,'YYYYMM') when reading from a raw source.
   When reading from another CTE, use YYYYMM directly.
 
+RULE 22 — TEXT COLUMN COMPARED TO NUMERIC LITERAL
+  Qlik allows comparing text fields to numbers (e.g. AccountDesc > 0) because it
+  dual-types everything. SQL databases do NOT — this will either error or silently
+  return wrong results.
+  ✗ WRONG: WHERE "AccountDesc" > 0
+  ✓ CORRECT (null/empty check): WHERE "AccountDesc" IS NOT NULL AND "AccountDesc" != ''
+  ✓ CORRECT (numeric content): WHERE TRY_CAST("AccountDesc" AS INTEGER) > 0
+  Apply this fix to ANY column whose name ends in Desc, Name, Label, Code, Text,
+  Title, Category, Type, or Status when compared to a numeric literal.
+
+RULE 23 — dbt CONFIG BLOCK
+  Every generated dbt model MUST start with a {{ config(...) }} block.
+  Minimum required:
+    {{ config(materialized='table', tags=['qlik_migration']) }}
+  Place it as the very first line before the WITH clause.
+
 Output format — use EXACTLY these two headers:
 ### SQL
 [complete dbt SQL — no fences]
@@ -2174,6 +2404,22 @@ RULE 21 — YYYYMM TYPE PROPAGATION ACROSS CTEs
     CASE WHEN YYYYMM <= DATE_TRUNC('month', DATE '2013-05-31')::DATE THEN 1 ELSE 0 END
   Rule of thumb: only apply TO_DATE(YYYYMM::varchar,'YYYYMM') when reading from a raw source.
   When reading from another CTE, use YYYYMM directly.
+
+RULE 22 — TEXT COLUMN COMPARED TO NUMERIC LITERAL
+  Qlik allows comparing text fields to numbers (e.g. AccountDesc > 0) because it
+  dual-types everything. SQL databases do NOT — this will either error or silently
+  return wrong results.
+  ✗ WRONG: WHERE "AccountDesc" > 0
+  ✓ CORRECT (null/empty check): WHERE "AccountDesc" IS NOT NULL AND "AccountDesc" != ''
+  ✓ CORRECT (numeric content): WHERE TRY_CAST("AccountDesc" AS INTEGER) > 0
+  Apply this fix to ANY column whose name ends in Desc, Name, Label, Code, Text,
+  Title, Category, Type, or Status when compared to a numeric literal.
+
+RULE 23 — dbt CONFIG BLOCK
+  Every generated dbt model MUST start with a {{ config(...) }} block.
+  Minimum required:
+    {{ config(materialized='table', tags=['qlik_migration']) }}
+  Place it as the very first line before the WITH clause.
 
 {get_dialect_guidance(dialect)}
 
