@@ -1,6 +1,7 @@
 
 import os
 import json
+import logging
 import uuid
 import sqlite3
 import zipfile
@@ -14,34 +15,44 @@ from datetime import datetime
 from backend.session_cache import SessionPlanCache
 from backend.cost_tracker import CostTracker
 from backend.feedback_routes import ensure_feedback_table, register_feedback_routes
-from backend.migration_validator import validate_migration_sql, needs_repair, issues_to_strings
+from backend.migration.validator import validate_migration_sql, needs_repair, issues_to_strings
 # pyrefly: ignore [missing-import]
 from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
 from flask_cors import CORS
 # pyrefly: ignore [missing-import]
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from backend.openrouter_client import call_openrouter_chat, call_openrouter_chat_stream
-from backend.dbt_routes import register_dbt_agent_routes
-from backend.qvf_runtime import attach_inline_samples_to_tables, build_graph_json, extract_model_from_script, extract_qvf, generate_description_rule_based, parse_sql_sections, prepare_script_for_migration
-from backend.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
-from backend.qlik_script_parser import parse_qlik_load_script
-from backend.advanced_qvf_extractor import extract_advanced_metadata
-from backend.sql_migration import (
+from backend.integrations.openrouter_client import (
+    call_gemini_chat,
+    call_groq_chat,
+    call_ollama_chat,
+    call_openrouter_chat,
+    call_openrouter_chat_stream,
+)
+from backend.integrations.dbt_routes import register_dbt_agent_routes
+from backend.extraction.qvf_runtime import attach_inline_samples_to_tables, build_graph_json, extract_model_from_script, extract_qvf, generate_description_rule_based, parse_sql_sections, prepare_script_for_migration
+from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
+from backend.migration.sql_generation import (
     extract_sql_generation_plan,
     format_sql_generation_plan,
-    generate_dbt_config_block,
     hash_text,
+    finalize_generated_sql,
+    detect_repair_regressions,
     needs_sql_repair,
     normalize_sql_description,
     parse_migration_response,
-    request_migration,
+    render_sql_from_load_plan,
     request_migration_with_validation,
     request_migration_one_shot,
     request_sql_repair,
+    validate_candidate_integrity,
     validate_generated_sql,
+    _audit_generated_sql_against_plan,
+    validation_issue_category,
     optimize_qvs_for_context,
 )
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables â€” always resolve relative to this file's directory
 # so the .env is found regardless of where Python is launched from.
@@ -102,6 +113,15 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 ALLOWED_EXTENSIONS = {'qvf'}
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_DEFAULT_MODEL = os.environ.get('OPENROUTER_MODEL', 'deepseek/deepseek-chat-v3-0324')
+AI_PROVIDER = os.environ.get('AI_PROVIDER', 'auto').strip().lower()
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+GROQ_MAX_TOKENS = int(os.environ.get('GROQ_MAX_TOKENS', '1800'))
+GROQ_MAX_PROMPT_CHARS = int(os.environ.get('GROQ_MAX_PROMPT_CHARS', '16000'))
+OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
+OLLAMA_MODEL = os.environ.get('OLLAMA_MODEL', 'qwen2.5-coder:14b')
 OPENROUTER_FALLBACK_MODELS = [
     model.strip() for model in os.environ.get(
         'OPENROUTER_MODEL_FALLBACKS',
@@ -112,6 +132,7 @@ if OPENROUTER_DEFAULT_MODEL not in OPENROUTER_FALLBACK_MODELS:
     OPENROUTER_FALLBACK_MODELS.insert(0, OPENROUTER_DEFAULT_MODEL)
 OPENROUTER_MAX_TOKENS = int(os.environ.get('OPENROUTER_MAX_TOKENS', '4000'))
 OPENROUTER_MAX_PROMPT_CHARS = int(os.environ.get('OPENROUTER_MAX_PROMPT_CHARS', '35000'))
+MIN_REQUIRED_OUTPUT_TOKENS = int(os.environ.get('MIN_REQUIRED_OUTPUT_TOKENS', '1500'))
 PROMPT_VERSION = '2026-05-05.v1'
 SQL_DESCRIPTION_STYLE = (
     "Write the ### DESCRIPTION as expert-level technical Markdown. "
@@ -168,6 +189,298 @@ def _is_openrouter_credit_error(exc):
     return 'requires more credits' in message or 'credits exhausted' in message
 
 
+def _selected_ai_provider():
+    if AI_PROVIDER and AI_PROVIDER != 'auto':
+        return AI_PROVIDER
+    if GEMINI_API_KEY:
+        return 'gemini'
+    if GROQ_API_KEY:
+        return 'groq'
+    if OPENROUTER_API_KEY:
+        return 'openrouter'
+    return 'ollama'
+
+
+def _active_ai_model(provider=None):
+    provider = provider or _selected_ai_provider()
+    if provider == 'gemini':
+        return GEMINI_MODEL
+    if provider == 'groq':
+        return GROQ_MODEL
+    if provider == 'ollama':
+        return OLLAMA_MODEL
+    return OPENROUTER_DEFAULT_MODEL
+
+
+def _has_ai_provider_configured(provider=None):
+    provider = provider or _selected_ai_provider()
+    if provider == 'gemini':
+        return bool(GEMINI_API_KEY)
+    if provider == 'groq':
+        return bool(GROQ_API_KEY)
+    if provider == 'ollama':
+        return bool(OLLAMA_BASE_URL and OLLAMA_MODEL)
+    return bool(OPENROUTER_API_KEY)
+
+
+def _affordable_openrouter_tokens(exc):
+    match = re.search(r'can only afford\s+(\d+)', str(exc), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _credit_budget_error(exc, requested_tokens, min_tokens):
+    affordable = _affordable_openrouter_tokens(exc)
+    if affordable is not None:
+        return (
+            "insufficient OpenRouter credits/token budget: "
+            f"requested {requested_tokens} output tokens, can only afford {affordable}, "
+            f"minimum required is {min_tokens}."
+        )
+    return (
+        "insufficient OpenRouter credits/token budget: OpenRouter rejected the request. "
+        "The migration was stopped instead of retrying with an unusably small output budget."
+    )
+
+
+def _is_token_budget_failure(message):
+    message = str(message or '').lower()
+    return (
+        'insufficient openrouter credits/token budget' in message
+        or 'minimum required is' in message
+        or 'can only afford' in message
+        or 'tokens per minute' in message
+        or 'rate_limit_exceeded' in message
+        or 'request too large for model' in message
+        or 'http 413' in message
+        or 'resource_exhausted' in message
+        or 'quota exceeded' in message
+        or 'generate_content_free_tier_requests' in message
+        or 'http 429' in message
+    )
+
+
+def _dedupe_plan_items(plan):
+    """Remove repeated LOAD blocks before deterministic low-credit rendering."""
+    deduped = []
+    seen = set()
+    for item in plan or []:
+        key = (
+            item.get('operation'),
+            item.get('table'),
+            item.get('source'),
+            tuple(item.get('source_tables') or []),
+            tuple(item.get('fields') or []),
+            tuple(item.get('filters') or []),
+            item.get('is_concatenate'),
+            item.get('concatenate_target'),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _source_name_from_plan_item(item):
+    raw = ''
+    for value in item.get('source_tables') or []:
+        if value:
+            raw = str(value)
+            break
+    raw = raw or str(item.get('source') or item.get('table') or 'source_table')
+    raw = re.sub(r"^\s*['\"]|['\"]\s*$", '', raw.strip())
+    raw = re.sub(r'\s*\([^)]*\)\s*$', '', raw)
+    raw = raw.replace('\\', '/').split('/')[-1]
+    raw = re.sub(r'\.qvd$', '', raw, flags=re.IGNORECASE)
+    return raw or str(item.get('table') or 'source_table')
+
+
+def _simple_select_expression(field):
+    field = str(field or '').strip()
+    if not field:
+        return ''
+    # Keep only direct field projections in the low-credit skeleton. Complex
+    # expressions need AI/rule coverage and should not leak Qlik syntax.
+    if re.search(r'\b(if|num|monthstart|makedate|makecast|addmonths|date)\s*\(', field, re.IGNORECASE):
+        return ''
+    if any(token in field for token in ('&', '$(', '(', ')')):
+        return ''
+    alias_match = re.match(r'(.+?)\s+AS\s+(.+)$', field, flags=re.IGNORECASE)
+    if alias_match:
+        expr = alias_match.group(1).strip().strip('[]')
+        alias = alias_match.group(2).strip().strip('[]').strip('"')
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_ ]*$', expr):
+            return f'"{expr}" AS "{alias}"'
+        return ''
+    name = field.strip('[]').strip('"')
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_ ]*$', name):
+        return f'"{name}"'
+    return ''
+
+
+def _safe_deterministic_skeleton(plan):
+    """Build a small valid dbt model when full deterministic rendering is unsafe."""
+    plan = _dedupe_plan_items(plan)
+    if not plan:
+        return ''
+    fact_item = next((item for item in plan if 'fact' in str(item.get('table') or '').lower()), plan[0])
+    fact_name = re.sub(r'[^A-Za-z0-9_]+', '_', str(fact_item.get('table') or 'facttable').strip()).strip('_').lower()
+    if not fact_name:
+        fact_name = 'facttable'
+    fields = [_simple_select_expression(field) for field in (fact_item.get('fields') or [])]
+    fields = [field for field in fields if field]
+    if not fields:
+        fields = ['*']
+    source_name = _source_name_from_plan_item(fact_item)
+    select_list = ',\n        '.join(fields)
+    return (
+        "{{ config(materialized='table', tags=['qlik_migration']) }}\n\n"
+        "WITH\n"
+        f"{fact_name} AS (\n"
+        "    SELECT\n"
+        f"        {select_list}\n"
+        f"    FROM {{{{ source('raw', '{source_name}') }}}}\n"
+        "),\n"
+        "final_model AS (\n"
+        f"    SELECT *\n    FROM {fact_name}\n"
+        ")\n"
+        "SELECT *\nFROM final_model"
+    )
+
+
+def _current_sql_fallback(current_sql, current_desc, message, plan, dialect='dbt'):
+    current = finalize_generated_sql(current_sql or '')
+    if not current.strip():
+        return None
+    integrity_issues = validate_candidate_integrity(current, plan=plan)
+    if integrity_issues:
+        return None
+    validation_issues = _audit_generated_sql_against_plan(current, plan=plan, dialect=dialect)
+    description = current_desc or (
+        'Preserved the last valid SQL because the configured AI provider could not support '
+        'a safe regeneration and deterministic fallback was rejected.'
+    )
+    return {
+        'status': 'complete_with_validation_issues' if validation_issues else 'complete',
+        'iterations': 0,
+        'score': 0.75,
+        'final_sql': current,
+        'sql': current,
+        'description': description,
+        'final_description': description,
+        'comparison': {'matched': False, 'differences': [], 'score': 0.75},
+        'comparison_summary': {'matched': False, 'differences': [], 'score': 0.75},
+        'validation_issues': validation_issues,
+        'warnings': [message, 'Preserved previous SQL because AI regeneration was blocked by token budget.'] + list(validation_issues or []),
+        'error': '',
+        'used_deterministic_fallback': True,
+        'selected_generation_mode': 'previous_sql_fallback',
+        'one_shot_validation_status': 'skipped_ai_token_budget',
+        'reason_for_entering_loop': '',
+    }
+
+
+def _deterministic_migration_result(message, qvs_script, plan, dialect='dbt', current_sql=None, current_desc=None):
+    """Return rule-rendered SQL when cloud AI cannot afford a usable response."""
+    plan = _dedupe_plan_items(plan if plan is not None else extract_sql_generation_plan(qvs_script or ''))
+    deterministic_sql = finalize_generated_sql(render_sql_from_load_plan(plan))
+    integrity_issues = validate_candidate_integrity(deterministic_sql, plan=plan)
+    if integrity_issues:
+        previous = _current_sql_fallback(current_sql, current_desc, message, plan, dialect=dialect)
+        if previous:
+            previous['warnings'].extend(integrity_issues)
+            return previous
+        skeleton_sql = finalize_generated_sql(_safe_deterministic_skeleton(plan))
+        skeleton_integrity = validate_candidate_integrity(skeleton_sql, plan=plan)
+        if not skeleton_integrity:
+            deterministic_sql = skeleton_sql
+            integrity_issues = [
+                'Full deterministic fallback was rejected; returned a minimal fact-source skeleton for review.'
+            ] + integrity_issues
+
+    validation_issues = _audit_generated_sql_against_plan(
+        deterministic_sql,
+        plan=plan,
+        qvs_script=qvs_script,
+        dialect=dialect,
+    )
+    if integrity_issues and not deterministic_sql.strip():
+        validation_issues = list(integrity_issues) + list(validation_issues or [])
+    categories = [validation_issue_category(issue) for issue in validation_issues or []]
+    has_blocking = any(category in {'compile_error', 'semantic_error'} for category in categories)
+    score = 0.65 if has_blocking else 0.85
+    description = (
+        'Generated using deterministic Qlik LOAD rendering because the configured AI provider '
+        'credits could not support the minimum safe SQL output token budget.'
+    )
+    return {
+        'status': 'complete_with_validation_issues' if validation_issues else 'complete',
+        'iterations': 0,
+        'score': score,
+        'final_sql': deterministic_sql,
+        'sql': deterministic_sql,
+        'description': description,
+        'final_description': description,
+        'comparison': {'matched': not has_blocking, 'differences': [], 'score': score},
+        'comparison_summary': {'matched': not has_blocking, 'differences': [], 'score': score},
+        'validation_issues': validation_issues,
+        'warnings': [message] + list(integrity_issues or []) + list(validation_issues or []),
+        'error': '',
+        'used_deterministic_fallback': True,
+        'selected_generation_mode': 'deterministic_fallback',
+        'one_shot_validation_status': 'skipped_ai_token_budget',
+        'reason_for_entering_loop': '',
+    }
+
+
+def _stream_openrouter_with_budget_retry(
+    api_key,
+    model,
+    prompt,
+    system_prompt=None,
+    temperature=0,
+    top_p=1,
+    max_tokens=2500,
+    max_prompt_chars=35000,
+    timeout=60,
+    min_tokens=MIN_REQUIRED_OUTPUT_TOKENS,
+):
+    try:
+        yield from call_openrouter_chat_stream(
+            api_key,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_prompt_chars=max_prompt_chars,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        affordable = _affordable_openrouter_tokens(exc) if _is_openrouter_credit_error(exc) else None
+        if affordable is not None and min_tokens <= affordable < max_tokens:
+            print(
+                "OPENROUTER CREDIT WARNING: retrying stream with affordable "
+                f"max_tokens={affordable} (requested {max_tokens})"
+            )
+            yield from call_openrouter_chat_stream(
+                api_key,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=affordable,
+                max_prompt_chars=max_prompt_chars,
+                timeout=timeout,
+            )
+            return
+        if _is_openrouter_credit_error(exc):
+            raise RuntimeError(_credit_budget_error(exc, max_tokens, min_tokens)) from exc
+        raise
+
+
 def call_openrouter(
     prompt,
     system_prompt=None,
@@ -178,40 +491,169 @@ def call_openrouter(
     max_prompt_chars=None,
     timeout=60,
     retries=1,
+    stream=False,
 ):
+    provider = _selected_ai_provider()
+    model = model or _active_ai_model(provider)
+    max_tokens = max_tokens if max_tokens is not None else OPENROUTER_MAX_TOKENS
+    max_prompt_chars = max_prompt_chars if max_prompt_chars is not None else OPENROUTER_MAX_PROMPT_CHARS
+    min_tokens = MIN_REQUIRED_OUTPUT_TOKENS
+    if max_tokens < min_tokens:
+        raise RuntimeError(
+            "insufficient AI output token budget: dbt SQL generation requires "
+            f"at least {min_tokens} output tokens, but max_tokens={max_tokens}."
+        )
+
+    if provider == 'gemini':
+        print(
+            f"GEMINI REQUEST model={model} prompt_chars={len(prompt)} "
+            f"max_tokens={max_tokens} max_prompt_chars={max_prompt_chars} stream={stream}"
+        )
+        if stream:
+            return iter([call_gemini_chat(
+                GEMINI_API_KEY,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_prompt_chars=max_prompt_chars,
+                timeout=timeout,
+                retries=retries,
+            )])
+        return call_gemini_chat(
+            GEMINI_API_KEY,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_prompt_chars=max_prompt_chars,
+            timeout=timeout,
+            retries=retries,
+        )
+
+    if provider == 'groq':
+        max_tokens = min(max_tokens, GROQ_MAX_TOKENS)
+        max_prompt_chars = min(max_prompt_chars, GROQ_MAX_PROMPT_CHARS)
+        logger.info(
+            "Groq request: model=%s prompt_chars=%d max_tokens=%d max_prompt_chars=%d stream=%s",
+            model,
+            len(prompt),
+            max_tokens,
+            max_prompt_chars,
+            stream,
+        )
+        if stream:
+            return iter([call_groq_chat(
+                GROQ_API_KEY,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_prompt_chars=max_prompt_chars,
+                timeout=timeout,
+                retries=retries,
+            )])
+        return call_groq_chat(
+            GROQ_API_KEY,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_prompt_chars=max_prompt_chars,
+            timeout=timeout,
+            retries=retries,
+        )
+
+    if provider == 'ollama':
+        logger.info(
+            "Ollama request: model=%s prompt_chars=%d max_tokens=%d max_prompt_chars=%d stream=%s",
+            model,
+            len(prompt),
+            max_tokens,
+            max_prompt_chars,
+            stream,
+        )
+        if stream:
+            return iter([call_ollama_chat(
+                OLLAMA_BASE_URL,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_prompt_chars=max_prompt_chars,
+                timeout=max(timeout, 180),
+                retries=0,
+            )])
+        return call_ollama_chat(
+            OLLAMA_BASE_URL,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            max_prompt_chars=max_prompt_chars,
+            timeout=max(timeout, 180),
+            retries=0,
+        )
+
     if not OPENROUTER_API_KEY:
         raise RuntimeError('OPENROUTER_API_KEY is not configured.')
 
     model = model or OPENROUTER_DEFAULT_MODEL
-    max_tokens = max_tokens if max_tokens is not None else OPENROUTER_MAX_TOKENS
-    max_prompt_chars = max_prompt_chars if max_prompt_chars is not None else OPENROUTER_MAX_PROMPT_CHARS
     model_candidates = [m for m in OPENROUTER_FALLBACK_MODELS if m]
     if model not in model_candidates:
         model_candidates.insert(0, model)
 
     last_error = None
-    tried_lower_tokens = False
-    tried_lower_prompt = False
+    tried_affordable_tokens = False
 
     for candidate_model in model_candidates:
         while True:
-            print(
-                f"OPENROUTER REQUEST model={candidate_model} prompt_chars={len(prompt)} "
-                f"max_tokens={max_tokens} max_prompt_chars={max_prompt_chars}"
+            logger.info(
+                "OpenRouter request: model=%s prompt_chars=%d max_tokens=%d max_prompt_chars=%d",
+                candidate_model,
+                len(prompt),
+                max_tokens,
+                max_prompt_chars,
             )
             try:
-                response_text = call_openrouter_chat(
-                    OPENROUTER_API_KEY,
-                    candidate_model,
-                    prompt,
-                    system_prompt=system_prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    max_prompt_chars=max_prompt_chars,
-                    timeout=timeout,
-                    retries=retries,
-                )
+                if stream:
+                    response_text = _stream_openrouter_with_budget_retry(
+                        OPENROUTER_API_KEY,
+                        candidate_model,
+                        prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        max_prompt_chars=max_prompt_chars,
+                        timeout=timeout,
+                        min_tokens=min_tokens,
+                    )
+                else:
+                    response_text = call_openrouter_chat(
+                        OPENROUTER_API_KEY,
+                        candidate_model,
+                        prompt,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        max_prompt_chars=max_prompt_chars,
+                        timeout=timeout,
+                        retries=retries,
+                    )
                 if candidate_model != model:
                     print(f"OPENROUTER FALLBACK ACTIVATED: switched to {candidate_model}")
                 return response_text
@@ -220,18 +662,17 @@ def call_openrouter(
                 if _is_openrouter_model_error(exc) and candidate_model != model_candidates[-1]:
                     print(f"OPENROUTER MODEL NOT AVAILABLE: {candidate_model}, trying fallback.")
                     break
-                if _is_openrouter_credit_error(exc) and not tried_lower_prompt and max_prompt_chars > 3500:
-                    tried_lower_prompt = True
-                    max_prompt_chars = 3500
+                affordable = _affordable_openrouter_tokens(exc) if _is_openrouter_credit_error(exc) else None
+                if (
+                    affordable is not None
+                    and min_tokens <= affordable < max_tokens
+                    and not tried_affordable_tokens
+                ):
+                    tried_affordable_tokens = True
+                    max_tokens = affordable
                     print(
-                        "OPENROUTER CREDIT WARNING: retrying with lower max_prompt_chars=3500"
-                    )
-                    continue
-                if _is_openrouter_credit_error(exc) and not tried_lower_tokens and max_tokens > 200:
-                    tried_lower_tokens = True
-                    max_tokens = 200
-                    print(
-                        "OPENROUTER CREDIT WARNING: retrying with lower max_tokens=200"
+                        "OPENROUTER CREDIT WARNING: retrying with affordable "
+                        f"max_tokens={max_tokens}"
                     )
                     continue
                 if _is_openrouter_credit_error(exc) and candidate_model != model_candidates[-1]:
@@ -240,11 +681,7 @@ def call_openrouter(
                     )
                     break
                 if _is_openrouter_credit_error(exc):
-                    raise RuntimeError(
-                        "OpenRouter prompt token limit exceeded or credits exhausted. "
-                        "Please top up credits, lower OPENROUTER_MAX_TOKENS / OPENROUTER_MAX_PROMPT_CHARS, "
-                        "or use a cheaper model."
-                    ) from exc
+                    raise RuntimeError(_credit_budget_error(exc, max_tokens, min_tokens)) from exc
                 raise
             break
 
@@ -264,34 +701,90 @@ def call_openrouter_fast(
     timeout=60,
     stream=False,
 ):
-    """Fast direct OpenRouter request with no fallback and no retry overhead.
+    """Fast direct AI request with no fallback and no retry overhead.
     
     When stream=True, returns a generator yielding text chunks.
     """
+    provider = _selected_ai_provider()
+    model = model or _active_ai_model(provider)
+    effective_max_tokens = min(max_tokens if max_tokens is not None else OPENROUTER_MAX_TOKENS, 10000)
+    effective_max_prompt_chars = min(max_prompt_chars if max_prompt_chars is not None else OPENROUTER_MAX_PROMPT_CHARS, 35000)
+    min_tokens = MIN_REQUIRED_OUTPUT_TOKENS
+    if effective_max_tokens < min_tokens:
+        raise RuntimeError(
+            "insufficient AI output token budget: dbt SQL generation requires "
+            f"at least {min_tokens} output tokens, but max_tokens={effective_max_tokens}."
+        )
+
+    if provider in {'gemini', 'groq', 'ollama'}:
+        return call_openrouter(
+            prompt,
+            system_prompt=system_prompt,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=effective_max_tokens,
+            max_prompt_chars=effective_max_prompt_chars,
+            timeout=timeout,
+            retries=0,
+            stream=stream,
+        )
+
     if not OPENROUTER_API_KEY:
         raise RuntimeError('OPENROUTER_API_KEY is not configured.')
-
-    model = model or OPENROUTER_DEFAULT_MODEL
-    effective_max_tokens = min(max_tokens if max_tokens is not None else OPENROUTER_MAX_TOKENS, 8000)
-    effective_max_prompt_chars = min(max_prompt_chars if max_prompt_chars is not None else OPENROUTER_MAX_PROMPT_CHARS, 35000)
 
     print(
         f"OPENROUTER FAST REQUEST model={model} prompt_chars={len(prompt)} "
         f"max_tokens={effective_max_tokens} max_prompt_chars={effective_max_prompt_chars} stream={stream}"
     )
-    return call_openrouter_chat(
-        OPENROUTER_API_KEY,
-        model,
-        prompt,
-        system_prompt=system_prompt,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=effective_max_tokens,
-        max_prompt_chars=effective_max_prompt_chars,
-        timeout=timeout,
-        retries=0,
-        stream=stream,
-    )
+    if stream:
+        return _stream_openrouter_with_budget_retry(
+            OPENROUTER_API_KEY,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=effective_max_tokens,
+            max_prompt_chars=effective_max_prompt_chars,
+            timeout=timeout,
+            min_tokens=min_tokens,
+        )
+    try:
+        return call_openrouter_chat(
+            OPENROUTER_API_KEY,
+            model,
+            prompt,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=effective_max_tokens,
+            max_prompt_chars=effective_max_prompt_chars,
+            timeout=timeout,
+            retries=0,
+        )
+    except Exception as exc:
+        affordable = _affordable_openrouter_tokens(exc) if _is_openrouter_credit_error(exc) else None
+        if affordable is not None and min_tokens <= affordable < effective_max_tokens:
+            print(
+                "OPENROUTER CREDIT WARNING: retrying fast request with affordable "
+                f"max_tokens={affordable} (requested {effective_max_tokens})"
+            )
+            return call_openrouter_chat(
+                OPENROUTER_API_KEY,
+                model,
+                prompt,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=affordable,
+                max_prompt_chars=effective_max_prompt_chars,
+                timeout=timeout,
+                retries=0,
+            )
+        if _is_openrouter_credit_error(exc):
+            raise RuntimeError(_credit_budget_error(exc, effective_max_tokens, min_tokens)) from exc
+        raise
 
 
 def get_cached_sql_plan(session_id, scripts_text):
@@ -326,9 +819,227 @@ def repair_generated_sql(sql_text, description_text, issues, dialect='dbt', qvs_
         plan_text=plan_text,
     )
 
-def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, current_desc=None, dialect='dbt', plan=None, plan_text=None, progress_callback=None, stream_callback=None):
+
+def _strip_sql_comments(sql_text):
+    """Remove SQL comments before lightweight structure checks."""
+    sql_text = sql_text or ''
+    sql_text = re.sub(r'/\*.*?\*/', '', sql_text, flags=re.DOTALL)
+    sql_text = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)
+    return sql_text.strip()
+
+
+def _extract_cte_names(sql_text):
+    """Return CTE names from a WITH query without hardcoding business table names."""
+    sql_text = _strip_sql_comments(sql_text)
+    return [
+        match.group(1).lower()
+        for match in re.finditer(
+            r'(?:\bWITH\b|,)\s+([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(',
+            sql_text,
+            flags=re.IGNORECASE,
+        )
+    ]
+
+
+def _final_select_source(sql_text):
+    """Return (is_select_star, source_name) for the final SELECT when detectable."""
+    sql_text = _strip_sql_comments(sql_text).rstrip(';').strip()
+    match = re.search(
+        r'\bSELECT\s+(\*|[\s\S]*?)\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:;)?\s*$',
+        sql_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False, ''
+    projection = re.sub(r'\s+', ' ', match.group(1)).strip()
+    return projection == '*', match.group(2).lower()
+
+
+def _cte_body(sql_text, cte_name):
+    """Best-effort CTE body extraction for validation heuristics."""
+    sql_text = _strip_sql_comments(sql_text)
+    pattern = re.compile(
+        rf'(?:\bWITH\b|,)\s+{re.escape(cte_name)}\s+AS\s*\(',
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(sql_text)
+    if not match:
+        return ''
+    start = match.end()
+    depth = 1
+    idx = start
+    while idx < len(sql_text):
+        char = sql_text[idx]
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth == 0:
+                return sql_text[start:idx]
+        idx += 1
+    return ''
+
+
+def _is_generic_shallow_final_model(sql_text):
+    """Detect generic bad one-shot output: many CTEs built, final output ignores them.
+
+    This is intentionally file-agnostic. It does not target specific Qlik tables.
+    It flags patterns such as:
+      WITH a AS (...), b AS (...), c AS (...)
+      SELECT * FROM a
+
+    It also flags a `final_model` CTE that only does `SELECT * FROM one_cte`
+    while several peer CTEs exist, because that still ignores the useful model graph.
+    """
+    cte_names = _extract_cte_names(sql_text)
+    cte_set = set(cte_names)
+    is_star, final_source = _final_select_source(sql_text)
+
+    if len(cte_set) < 3 or not is_star or final_source not in cte_set:
+        return False
+
+    if final_source != 'final_model':
+        return True
+
+    body = _cte_body(sql_text, 'final_model')
+    body_star, body_source = _final_select_source(body)
+    if body_star and body_source in cte_set and len(cte_set - {'final_model', body_source}) >= 2:
+        return True
+
+    return False
+
+
+def _generic_one_shot_quality_issues(sql_text, plan=None):
+    """Extra generic one-shot checks that prevent costly loop escalation.
+
+    These checks are not tied to any specific customer file. They only inspect SQL
+    structure and the extracted migration plan size.
+    """
+    issues = []
+    sql_text = sql_text or ''
+    cte_names = _extract_cte_names(sql_text)
+    cte_set = set(cte_names)
+    is_star, final_source = _final_select_source(sql_text)
+    plan_size = len(plan or [])
+
+    if plan_size >= 3 and len(cte_set) >= 3 and 'final_model' not in cte_set:
+        issues.append(
+            'FINAL_MODEL_MISSING: generated SQL creates multiple CTEs but does not create a final_model CTE.'
+        )
+
+    if _is_generic_shallow_final_model(sql_text):
+        issues.append(
+            'FINAL_SELECT_TOO_SHALLOW: generated SQL creates multiple CTEs but final output selects from only one intermediate CTE.'
+        )
+
+    if len(cte_set) >= 3 and is_star and final_source in cte_set and final_source != 'final_model':
+        unused_count = len(cte_set - {final_source})
+        if unused_count >= 2:
+            issues.append(
+                f'CTE_CREATED_BUT_UNUSED: final SELECT reads only {final_source}; {unused_count} other CTE(s) are not used in the final output.'
+            )
+
+    return issues
+
+
+def _blocking_issue_categories(issues):
+    return [validation_issue_category(issue) for issue in issues or []]
+
+
+def _has_blocking_issues(issues):
+    # Reserve the expensive validation loop for SQL that is structurally unsafe
+    # or cannot compile. Optional lookup/dimension coverage should remain a warning.
+    blocking_markers = (
+        'EMPTY_SQL',
+        'UNBALANCED_PARENS',
+        'PARENTHESES LOOK UNBALANCED',
+        'BARE_DDL',
+        'SOURCE_TABLE_RENAMED',
+        'ALIAS_COLUMN_NOT_FOUND',
+        'JOIN_KEY_MISSING',
+        'FINAL_MODEL_MISSING',
+        'FINAL_SELECT_TOO_SHALLOW',
+        'UNION_COLUMN_MISMATCH',
+        'UNION_SELECT_STAR',
+    )
+    return any(
+        any(marker in str(issue).upper() for marker in blocking_markers)
+        for issue in issues or []
+    )
+
+
+def _one_shot_repair_once(quick_result, issues, qvs_script, plan, plan_text, dialect, progress_callback=None):
+    """Make one small repair attempt before entering the expensive loop."""
+    if not quick_result or not issues:
+        return quick_result, issues, False
+
+    original_sql = finalize_generated_sql(quick_result.get('sql', '') or quick_result.get('final_sql', ''))
+    if not original_sql.strip():
+        return quick_result, issues, False
+
+    if progress_callback:
+        progress_callback('One-shot SQL needs structural repair; attempting one targeted repair before validation loop.')
+
+    try:
+        repaired_raw = repair_generated_sql(
+            original_sql,
+            quick_result.get('description') or quick_result.get('final_description') or '',
+            issues,
+            dialect=dialect,
+            qvs_script=(qvs_script or '')[:12000],
+            plan_text=plan_text,
+        )
+        repaired_result = parse_migration_response(repaired_raw) if isinstance(repaired_raw, str) else repaired_raw
+        if not repaired_result or not repaired_result.get('sql'):
+            return quick_result, issues, False
+
+        repaired_sql = finalize_generated_sql(repaired_result.get('sql') or '')
+        if not repaired_sql.strip():
+            return quick_result, issues, False
+
+        integrity_issues = validate_candidate_integrity(repaired_sql, plan=plan)
+        if integrity_issues:
+            quick_result.setdefault('warnings', []).extend(integrity_issues)
+            return quick_result, issues + integrity_issues, False
+
+        regressions = detect_repair_regressions(original_sql, repaired_sql)
+        if regressions:
+            quick_result.setdefault('warnings', []).extend(regressions)
+            return quick_result, issues + regressions, False
+
+        repaired_issues = _audit_generated_sql_against_plan(
+            repaired_sql,
+            plan=plan,
+            qvs_script=qvs_script,
+            dialect=dialect,
+        )
+        repaired_issues = list(repaired_issues or []) + _generic_one_shot_quality_issues(repaired_sql, plan=plan)
+
+        repaired_result['sql'] = repaired_sql
+        repaired_result['final_sql'] = repaired_sql
+        repaired_result['description'] = repaired_result.get('description') or quick_result.get('description') or ''
+        repaired_result['final_description'] = repaired_result.get('final_description') or repaired_result['description']
+        repaired_result['validation_issues'] = repaired_issues
+        repaired_result['warnings'] = list(dict.fromkeys((repaired_result.get('warnings') or []) + repaired_issues))
+        repaired_result['status'] = 'complete_with_validation_issues' if repaired_issues else 'complete'
+        repaired_result['used_one_shot_repair'] = True
+        return repaired_result, repaired_issues, True
+    except Exception as exc:
+        quick_result.setdefault('warnings', []).append(f'One-shot repair failed: {exc}')
+        return quick_result, issues + [f'One-shot repair failed: {exc}'], False
+
+
+def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, current_desc=None, dialect='dbt', plan=None, plan_text=None, progress_callback=None, stream_callback=None, generation_mode='auto'):
+    generation_mode = (generation_mode or 'auto').strip().lower()
+    if generation_mode not in {'auto', 'one_shot', 'loop'}:
+        generation_mode = 'auto'
+    provider_prompt_version = f"{PROMPT_VERSION}.{_selected_ai_provider()}"
+    logger.info("Migration mode selected: %s", generation_mode)
+    if progress_callback:
+        progress_callback(f"Selected generation mode: {generation_mode}")
+
     if (dialect or '').lower() == 'powerbi':
-        return request_migration_one_shot(
+        result = request_migration_one_shot(
             call_openrouter_fast,
             qvs_script,
             session_context=session_context,
@@ -337,14 +1048,52 @@ def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, curre
             dialect=dialect,
             plan=plan,
             plan_text=plan_text,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=provider_prompt_version,
             description_style=SQL_DESCRIPTION_STYLE,
             progress_callback=progress_callback,
             stream_callback=stream_callback,
         )
+        result['selected_generation_mode'] = 'one_shot'
+        return result
 
-    # Try a fast one-shot migration first. This is often much faster than the
-    # validation loop and still produces valid SQL in the majority of cases.
+    if generation_mode == 'loop':
+        logger.info("Migration loop mode requested explicitly")
+        if progress_callback:
+            progress_callback('Starting Senior AI/ML validation loop directly...')
+        try:
+            result = request_migration_with_validation(
+                call_openrouter,
+                qvs_script,
+                session_context=session_context,
+                current_sql=current_sql,
+                current_desc=current_desc,
+                dialect=dialect,
+                plan=plan,
+                plan_text=plan_text,
+                prompt_version=provider_prompt_version,
+                description_style=SQL_DESCRIPTION_STYLE,
+                max_iterations=8,
+                progress_callback=progress_callback,
+                stream_callback=stream_callback,
+            )
+        except Exception as exc:
+            if _is_token_budget_failure(exc):
+                message = str(exc)
+                if progress_callback:
+                    progress_callback('AI provider token budget is too low; using deterministic SQL generation.')
+                return _deterministic_migration_result(
+                    message,
+                    qvs_script,
+                    plan,
+                    dialect=dialect,
+                    current_sql=current_sql,
+                    current_desc=current_desc,
+                )
+            raise
+        result['selected_generation_mode'] = 'loop'
+        result['reason_for_entering_loop'] = 'explicit_loop_mode'
+        return result
+
     try:
         if progress_callback:
             progress_callback('Attempting fast one-shot DBT migration...')
@@ -357,32 +1106,126 @@ def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, curre
             dialect=dialect,
             plan=plan,
             plan_text=plan_text,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=provider_prompt_version,
             description_style=SQL_DESCRIPTION_STYLE,
             progress_callback=progress_callback,
             stream_callback=stream_callback,
         )
-        quick_issues = validate_generated_sql(quick_result.get('sql', ''), plan, dialect)
-        # Also reject shallow output: if every CTE is just SELECT * with no field list,
-        # the one-shot prompt didn't do real work — escalate to the full validation loop.
-        quick_sql = quick_result.get('sql', '')
-        cte_count = quick_sql.upper().count(' AS (')
-        select_star_count = len(re.findall(r'SELECT\s+\*\s+FROM', quick_sql, re.IGNORECASE))
-        is_shallow = cte_count > 0 and select_star_count >= cte_count
-        if (not quick_issues or not needs_sql_repair(quick_issues)) and not is_shallow:
+        if quick_result.get('status') == 'failed' and quick_result.get('error'):
+            if _is_token_budget_failure(quick_result.get('error')):
+                if progress_callback:
+                    progress_callback('AI provider token budget is too low; using deterministic SQL generation.')
+                return _deterministic_migration_result(
+                    quick_result['error'],
+                    qvs_script,
+                    plan,
+                    dialect=dialect,
+                    current_sql=current_sql,
+                    current_desc=current_desc,
+                )
             if progress_callback:
-                progress_callback('Fast one-shot migration succeeded.')
+                progress_callback(f"Fast one-shot migration stopped: {quick_result['error']}")
             return quick_result
-        reason = 'shallow SELECT * output' if is_shallow else 'validation issues'
+
+        quick_sql = finalize_generated_sql(quick_result.get('sql', '') or quick_result.get('final_sql', ''))
+        quick_result['sql'] = quick_sql
+        quick_result['final_sql'] = quick_sql
+
+        audit_issues = _audit_generated_sql_against_plan(
+            quick_sql,
+            plan=plan,
+            qvs_script=qvs_script,
+            dialect=dialect,
+        )
+        generic_issues = _generic_one_shot_quality_issues(quick_sql, plan=plan)
+        quick_issues = list(dict.fromkeys(list(audit_issues or []) + generic_issues))
+        quick_result['validation_issues'] = quick_issues
+
+        # One targeted repair before the expensive Senior AI/ML loop.
+        # This is the key change: loop is now reserved for cases that remain
+        # blocking after a cheap one-shot repair attempt.
+        should_repair_once = bool(generic_issues) or bool(quick_issues and needs_sql_repair(quick_issues))
+        repair_attempted = False
+        if should_repair_once:
+            quick_result, quick_issues, repair_attempted = _one_shot_repair_once(
+                quick_result,
+                quick_issues,
+                qvs_script,
+                plan,
+                plan_text,
+                dialect,
+                progress_callback=progress_callback,
+            )
+            quick_sql = finalize_generated_sql(quick_result.get('sql', '') or quick_result.get('final_sql', ''))
+            quick_result['sql'] = quick_sql
+            quick_result['final_sql'] = quick_sql
+            quick_result['validation_issues'] = quick_issues
+
+        has_blocking_one_shot_issues = _has_blocking_issues(quick_issues)
+        one_shot_validation_status = (
+            'blocking_issues_after_repair' if has_blocking_one_shot_issues and repair_attempted
+            else 'blocking_issues' if has_blocking_one_shot_issues
+            else 'passed_after_repair' if repair_attempted
+            else 'passed_with_warnings' if quick_issues
+            else 'passed'
+        )
+        quick_result['selected_generation_mode'] = generation_mode
+        quick_result['one_shot_validation_status'] = one_shot_validation_status
+        quick_result['used_one_shot_repair'] = bool(quick_result.get('used_one_shot_repair') or repair_attempted)
+        quick_result['warnings'] = list(dict.fromkeys((quick_result.get('warnings') or []) + quick_issues))
+
+        logger.info(
+            "One-shot validation status=%s categories=%s issues=%s repair_attempted=%s",
+            one_shot_validation_status,
+            _blocking_issue_categories(quick_issues)[:5],
+            quick_issues[:5],
+            repair_attempted,
+        )
+
+        if not has_blocking_one_shot_issues:
+            quick_result['reason_for_entering_loop'] = ''
+            if progress_callback:
+                if repair_attempted:
+                    progress_callback('One-shot migration passed after targeted repair.')
+                else:
+                    progress_callback(
+                        'Fast one-shot migration completed with warnings.'
+                        if quick_issues else 'Fast one-shot migration succeeded.'
+                    )
+            quick_result['status'] = 'complete_with_validation_issues' if quick_issues else quick_result.get('status', 'complete')
+            return quick_result
+
+        if generation_mode == 'one_shot':
+            quick_result['status'] = 'complete_with_validation_issues' if quick_result.get('status') == 'complete' else quick_result.get('status', 'complete')
+            quick_result['reason_for_entering_loop'] = ''
+            if progress_callback:
+                progress_callback('One-shot mode completed with blocking validation issues; Senior loop not started.')
+            return quick_result
+
+        reason = 'blocking validation issues after one-shot repair' if repair_attempted else 'blocking validation issues'
+        logger.info("Entering validation loop after one-shot: reason=%s", reason)
         if progress_callback:
             progress_callback(f'Fast one-shot migration returned {reason}; switching to the validation loop...')
     except Exception as e:
-        print(f"WARNING: Fast one-shot migration failed: {str(e)}")
+        if _is_token_budget_failure(e):
+            message = str(e)
+            logger.warning("Fast one-shot migration stopped by token budget: %s", message)
+            if progress_callback:
+                progress_callback('AI provider token budget is too low; using deterministic SQL generation.')
+            return _deterministic_migration_result(
+                message,
+                qvs_script,
+                plan,
+                dialect=dialect,
+                current_sql=current_sql,
+                current_desc=current_desc,
+            )
+        logger.warning("Fast one-shot migration failed; falling back to validation loop: %s", e)
         if progress_callback:
             progress_callback('Fast one-shot migration failed; switching to the validation loop...')
 
     try:
-        return request_migration_with_validation(
+        result = request_migration_with_validation(
             call_openrouter,
             qvs_script,
             session_context=session_context,
@@ -391,28 +1234,45 @@ def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, curre
             dialect=dialect,
             plan=plan,
             plan_text=plan_text,
-            prompt_version=PROMPT_VERSION,
+            prompt_version=provider_prompt_version,
             description_style=SQL_DESCRIPTION_STYLE,
             max_iterations=8,
             progress_callback=progress_callback,
             stream_callback=stream_callback,
         )
+        result['selected_generation_mode'] = generation_mode
+        result['one_shot_validation_status'] = 'blocking_issues_after_one_shot_repair'
+        result['reason_for_entering_loop'] = 'auto_fallback_after_one_shot_repair_blocking_issues'
+        return result
     except Exception as e:
-        print(f"WARNING: Validation loop failed ({str(e)}). Falling back to one-shot migration.")
-        return request_migration_one_shot(
-            call_openrouter_fast,
-            qvs_script,
-            session_context=session_context,
-            current_sql=current_sql,
-            current_desc=current_desc,
-            dialect=dialect,
-            plan=plan,
-            plan_text=plan_text,
-            prompt_version=PROMPT_VERSION,
-            description_style=SQL_DESCRIPTION_STYLE,
-            progress_callback=progress_callback,
-            stream_callback=stream_callback,
-        )
+        message = str(e)
+        if _is_token_budget_failure(message):
+            logger.warning("Validation loop stopped by token budget: %s", message)
+            if progress_callback:
+                progress_callback('AI provider token budget is too low; using deterministic SQL generation.')
+            return _deterministic_migration_result(
+                message,
+                qvs_script,
+                plan,
+                dialect=dialect,
+                current_sql=current_sql,
+                current_desc=current_desc,
+            )
+        logger.warning("Validation loop stopped: %s", message)
+        if progress_callback:
+            progress_callback(f"Migration stopped: {message}")
+        return {
+            'status': 'failed',
+            'iterations': 0,
+            'score': 0.0,
+            'final_sql': '',
+            'sql': '',
+            'description': '',
+            'final_description': '',
+            'error': message,
+            'warnings': [message],
+            'used_deterministic_fallback': False,
+        }
 
 # Reset DB on startup for clean demo (optional, can be triggered via API)
 def reset_db():
@@ -860,8 +1720,12 @@ def serialize_session_file(row, file_map, cached_plan=None):
 
 
 def maybe_store_regeneration_state(session_id, file_id, edited_sql, edited_text, structured, status='complete', model=None, job_id=None, prompt_version=None):
-    sql_text = structured.get('sql') or edited_sql or ''
-    desc_text = structured.get('description') or edited_text or ''
+    if status == 'failed':
+        sql_text = structured.get('sql') or ''
+        desc_text = structured.get('description') or ''
+    else:
+        sql_text = structured.get('sql') or edited_sql or ''
+        desc_text = structured.get('description') or edited_text or ''
     upsert_regeneration_state(
         session_id,
         file_id,
@@ -877,8 +1741,8 @@ def maybe_store_regeneration_state(session_id, file_id, edited_sql, edited_text,
     )
 
 
-def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, regenerated_sql, regenerated_text, dialect, combined_scripts, cached_plan, input_hash, trigger_migration):
-    model = OPENROUTER_DEFAULT_MODEL
+def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, regenerated_sql, regenerated_text, dialect, combined_scripts, cached_plan, input_hash, trigger_migration, generation_mode='auto'):
+    model = _active_ai_model()
     prompt_version = PROMPT_VERSION
     status = 'complete'
     error_text = ''
@@ -904,12 +1768,17 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                 'progress_message': 'Starting...' if trigger_migration else 'Complete',
                 'last_heartbeat': time.time(),
             }
-        print(f"RUN_JOB STATUS job_id={job_id} status=running session={session_id}")
+        logger.info("Regeneration job started: job_id=%s session=%s", job_id, session_id)
 
-        if trigger_migration and OPENROUTER_API_KEY:
+        if trigger_migration and _has_ai_provider_configured():
             target_label = 'Power BI (M + DAX)' if is_powerbi else f'DBT [{dialect}]'
-            print(f"AI Migration Triggered → {target_label} | session={session_id}")
-            print(f"RUN_JOB AI CALL job_id={job_id} plan_size={len(cached_plan.get('plan', []))} combined_scripts_len={len(combined_scripts or '')} plan_text_preview={repr(cached_plan.get('planText','')[:200])}")
+            logger.info(
+                "AI migration triggered: target=%s session=%s plan_size=%d script_chars=%d",
+                target_label,
+                session_id,
+                len(cached_plan.get('plan', [])),
+                len(combined_scripts or ''),
+            )
             
             # Define progress callback to update job timestamp during AI iterations
             def progress_callback(message=None):
@@ -961,37 +1830,72 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                 plan_text=cached_plan['planText'],
                 progress_callback=progress_callback,
                 stream_callback=stream_callback,
+                generation_mode=generation_mode,
             )
-            print(f"RUN_JOB AI RETURN job_id={job_id} migration_result_type={type(migration_result).__name__} len={len(str(migration_result)) if migration_result is not None else 0}")
-            if isinstance(migration_result, dict):
-                print(f"  Migration result final_sql length: {len(migration_result.get('final_sql', ''))}")
-                print(f"  Migration result sql length: {len(migration_result.get('sql', ''))}")
-                print(f"  Migration result keys: {list(migration_result.keys())}")
+            logger.info(
+                "AI migration returned: job_id=%s result_type=%s sql_chars=%d",
+                job_id,
+                type(migration_result).__name__,
+                len((migration_result or {}).get('final_sql', '') if isinstance(migration_result, dict) else str(migration_result or '')),
+            )
             if migration_result:
-                print(f"AI Migration result received for session {session_id}")
                 if isinstance(migration_result, dict):
+                    result_status = migration_result.get('status') or 'complete'
+                    result_error = migration_result.get('error') or ''
                     migration_sql = migration_result.get('sql') or ''
                     migration_final_sql = migration_result.get('final_sql') or ''
                     chosen_sql = migration_final_sql if len(migration_final_sql) > len(migration_sql) else migration_sql
+                    chosen_sql = finalize_generated_sql(chosen_sql) if chosen_sql else ''
+                    migration_result['sql'] = chosen_sql
+                    migration_result['final_sql'] = chosen_sql
                     migration_desc = migration_result.get('description') or ''
                     migration_final_desc = migration_result.get('final_description') or ''
                     chosen_desc = migration_final_desc if len(migration_final_desc) > len(migration_desc) else migration_desc
-
-                    structured = {
-                        'sql': chosen_sql,
-                        'description': chosen_desc,
-                        'lineage': migration_result.get('lineage', ''),
-                        'warnings': migration_result.get('warnings', []),
-                        'promptVersion': prompt_version,
-                        'model': model,
-                        'status': 'complete',
-                        'comparisonSummary': migration_result.get('comparison_summary', {}),
-                        'validationStatus': migration_result.get('status', 'complete'),
-                        'semanticScore': round(float(migration_result.get('score', 0.0)), 2),
-                        'iterations': migration_result.get('iterations', 1),
-                    }
-                    regenerated_sql = structured['sql'] or regenerated_sql or edited_sql
-                    regenerated_text = structured['description'] or regenerated_text or edited_text
+                    if result_status == 'failed' or (trigger_migration and not chosen_sql.strip()):
+                        status = 'failed'
+                        error_text = result_error or 'AI migration failed without returning SQL.'
+                        structured = {
+                            'sql': '',
+                            'description': chosen_desc,
+                            'lineage': migration_result.get('lineage', ''),
+                            'warnings': migration_result.get('warnings', []) + [error_text],
+                            'promptVersion': prompt_version,
+                            'model': model,
+                            'status': status,
+                            'comparisonSummary': migration_result.get('comparison_summary', {}),
+                            'validationStatus': result_status,
+                            'semanticScore': round(float(migration_result.get('score', 0.0)), 2),
+                            'iterations': migration_result.get('iterations', 0),
+                            'error': error_text,
+                            'usedDeterministicFallback': bool(migration_result.get('used_deterministic_fallback', False)),
+                            'selectedGenerationMode': migration_result.get('selected_generation_mode', generation_mode),
+                            'oneShotValidationStatus': migration_result.get('one_shot_validation_status', ''),
+                            'reasonForEnteringLoop': migration_result.get('reason_for_entering_loop', ''),
+                        }
+                        regenerated_sql = ''
+                        regenerated_text = chosen_desc
+                        logger.warning("AI migration failed: job_id=%s status=%s error=%s", job_id, result_status, error_text)
+                    else:
+                        structured = {
+                            'sql': chosen_sql,
+                            'description': chosen_desc,
+                            'lineage': migration_result.get('lineage', ''),
+                            'warnings': migration_result.get('warnings', []),
+                            'promptVersion': prompt_version,
+                            'model': model,
+                            'status': result_status,
+                            'comparisonSummary': migration_result.get('comparison_summary', {}),
+                            'validationStatus': result_status,
+                            'semanticScore': round(float(migration_result.get('score', 0.0)), 2),
+                            'iterations': migration_result.get('iterations', 1),
+                            'error': result_error,
+                            'usedDeterministicFallback': bool(migration_result.get('used_deterministic_fallback', False)),
+                            'selectedGenerationMode': migration_result.get('selected_generation_mode', generation_mode),
+                            'oneShotValidationStatus': migration_result.get('one_shot_validation_status', ''),
+                            'reasonForEnteringLoop': migration_result.get('reason_for_entering_loop', ''),
+                        }
+                        regenerated_sql = structured['sql'] or regenerated_sql or edited_sql
+                        regenerated_text = structured['description'] or regenerated_text or edited_text
                 else:
                     print(f"AI Response received ({len(str(migration_result))} chars) for session {session_id}")
                     structured = parse_migration_response(str(migration_result))
@@ -1001,12 +1905,14 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                     regenerated_sql = structured['sql'] or regenerated_sql or edited_sql
                     regenerated_text = structured['description'] or regenerated_text or edited_text
 
-                validation_issues = issues_to_strings(validate_migration_sql(regenerated_sql, cached_plan['plan'], dialect=dialect))
-                structured.setdefault('warnings', [])
-                structured['warnings'].extend(validation_issues)
+                validation_issues = []
+                if status != 'failed':
+                    validation_issues = issues_to_strings(validate_migration_sql(regenerated_sql, cached_plan['plan'], dialect=dialect))
+                    structured.setdefault('warnings', [])
+                    structured['warnings'].extend(validation_issues)
 
                 # Run SQL repair if validation issues are detected
-                if not is_powerbi and validation_issues and needs_sql_repair(validation_issues):
+                if status != 'failed' and not is_powerbi and validation_issues and needs_sql_repair(validation_issues):
                     print(f"SQL repair triggered for session {session_id} to fix: {validation_issues}")
                     try:
                         repaired_raw = repair_generated_sql(
@@ -1021,9 +1927,21 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                         repaired_result = parse_migration_response(repaired_raw) if isinstance(repaired_raw, str) else repaired_raw
                         if repaired_result and repaired_result.get('sql'):
                             print(f"SQL repair successful for session {session_id} — repaired sql_len={len(repaired_result['sql'])}")
-                            # Apply CTE name deduplication post-processing in python
-                            from backend.sql_migration import deduplicate_ctes
-                            repaired_result['sql'] = deduplicate_ctes(repaired_result['sql'])
+                            # Apply deterministic post-repair invariants in python
+                            repaired_result['sql'] = finalize_generated_sql(repaired_result['sql'])
+                            integrity_issues = validate_candidate_integrity(
+                                repaired_result['sql'],
+                                plan=cached_plan['plan'],
+                            )
+                            if integrity_issues:
+                                print(f"SQL repair rejected for session {session_id} due to candidate corruption: {integrity_issues}")
+                                structured.setdefault('warnings', []).extend(integrity_issues)
+                                raise RuntimeError('; '.join(integrity_issues))
+                            regressions = detect_repair_regressions(regenerated_sql, repaired_result['sql'])
+                            if regressions:
+                                print(f"SQL repair rejected for session {session_id} due to regressions: {regressions}")
+                                structured.setdefault('warnings', []).extend(regressions)
+                                raise RuntimeError('; '.join(regressions))
                             regenerated_sql = repaired_result['sql']
                             regenerated_text = repaired_result.get('description') or regenerated_text
                             structured['sql'] = regenerated_sql
@@ -1037,28 +1955,54 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                         print(f"WARNING: SQL repair failed: {str(re)}")
                         structured['warnings'].append(f"SQL repair failed: {str(re)}")
 
-                structured['sql'] = regenerated_sql or edited_sql or ''
+                if status == 'failed':
+                    structured['sql'] = ''
+                else:
+                    structured['sql'] = finalize_generated_sql(regenerated_sql or edited_sql or '') if not is_powerbi else (regenerated_sql or edited_sql or '')
+                    if not is_powerbi:
+                        final_integrity_issues = validate_generated_sql(
+                            structured['sql'],
+                            plan=cached_plan['plan'],
+                            dialect=dialect,
+                        )
+                        if final_integrity_issues:
+                            status = 'failed'
+                            error_text = '; '.join(final_integrity_issues)
+                            structured.setdefault('warnings', []).extend(final_integrity_issues)
+                            structured['error'] = error_text
+                            structured['status'] = status
+                            structured['sql'] = ''
+                            logger.warning("Final SQL rejected: job_id=%s issues=%s", job_id, final_integrity_issues)
+                    regenerated_sql = structured['sql']
 
                 # Power BI: keep the description as-is (it's already M/DAX aware)
                 # DBT: normalize into ## Block: sections
-                if is_powerbi:
+                if status == 'failed':
+                    structured['description'] = regenerated_text or ''
+                elif is_powerbi:
                     structured['description'] = regenerated_text or edited_text or ''
                 else:
                     structured['description'] = normalize_sql_description(regenerated_text or edited_text, cached_plan['plan'])
             else:
-                print(f"WARN: AI Response empty for session {session_id}")
+                logger.warning("AI response empty: session=%s", session_id)
                 structured['warnings'].append('AI response was empty; using the current draft state.')
         else:
             if trigger_migration:
-                print(f"WARN: OpenRouter API key not set â€” skipping AI migration for session {session_id}")
-                structured['warnings'].append('OpenRouter API key is not configured. Set OPENROUTER_API_KEY in your .env file and restart the server.')
+                logger.warning("AI provider not configured; skipping migration: session=%s", session_id)
+                structured['warnings'].append('AI provider is not configured. Set AI_PROVIDER and the provider key/base URL in your .env file, then restart the server.')
 
         # Final description normalisation (DBT only)
-        if not is_powerbi:
+        if status != 'failed' and not is_powerbi:
             structured['description'] = normalize_sql_description(structured.get('description'), cached_plan['plan'])
 
         structured['status'] = status
-        print(f"RUN_JOB FINALIZE job_id={job_id} status={status} sql_len={len(structured.get('sql', ''))} warnings_count={len(structured.get('warnings', []))}")
+        logger.info(
+            "Regeneration job finalized: job_id=%s status=%s sql_chars=%d warnings=%d",
+            job_id,
+            status,
+            len(structured.get('sql', '')),
+            len(structured.get('warnings', [])),
+        )
         maybe_store_regeneration_state(
             session_id,
             file_id,
@@ -1071,7 +2015,6 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
             prompt_version=prompt_version,
         )
         finalize_regeneration_history_entry(job_id, structured, error_text='', status=status)
-        print(f"RUN_JOB DONE job_id={job_id} - history entry finalized")
 
         with REGENERATION_LOCK:
             REGENERATION_JOBS[job_id] = {
@@ -1086,25 +2029,25 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                 'generationPlan': cached_plan['plan'],
                 'generationPlanText': cached_plan['planText'],
             }
-        print(f"Job {job_id} completed with status={status} | sql_len={len(structured.get('sql',''))} | warnings={structured.get('warnings',[])}")
+        logger.info("Regeneration job completed: job_id=%s status=%s", job_id, status)
 
         # Push final result into SSE stream queue (if a client is listening)
         try:
             q = _get_or_create_stream_queue(job_id)
-            q.put({'type': 'done', 'sql': structured.get('sql', ''), 'description': structured.get('description', ''), 'warnings': structured.get('warnings', [])})
+            if status == 'failed':
+                q.put({'type': 'error', 'message': error_text or structured.get('error') or 'Migration failed'})
+            else:
+                q.put({'type': 'done', 'sql': structured.get('sql', ''), 'description': structured.get('description', ''), 'warnings': structured.get('warnings', [])})
         except Exception:
             pass
         threading.Timer(60, _cleanup_stream_queue, args=[job_id]).start()
 
     except Exception as exc:
-        import traceback
         error_text = str(exc)
         status = 'failed'
         structured['status'] = status
         structured['warnings'].append(error_text)
-        print(f"RUN_JOB EXCEPTION job_id={job_id} error_text={error_text}")
-        print(f"ERROR: Job {job_id} failed: {error_text}")
-        traceback.print_exc()
+        logger.exception("Regeneration job failed: job_id=%s error=%s", job_id, error_text)
         maybe_store_regeneration_state(
             session_id,
             file_id,
@@ -1388,6 +2331,9 @@ def regenerate():
     regenerated_sql = data.get('regeneratedSql', '')
     regenerated_text = data.get('regeneratedText', '')
     dialect = data.get('dialect', 'dbt')
+    generation_mode = (data.get('generationMode') or data.get('generation_mode') or 'auto').strip().lower()
+    if generation_mode not in {'auto', 'one_shot', 'loop'}:
+        generation_mode = 'auto'
     bundle = build_session_bundle(session_id) if session_id else None
     if not bundle:
         return jsonify({'error': 'No data found for regeneration'}), 404
@@ -1411,6 +2357,7 @@ def regenerate():
         'regeneratedText': regenerated_text,
         'dialect': dialect,
         'triggerMigration': trigger_migration,
+        'generationMode': generation_mode,
         'planHash': cached_plan['hash'],
     }
     input_hash = hash_text(json.dumps(input_payload, sort_keys=True))
@@ -1422,7 +2369,7 @@ def regenerate():
         cached_plan['planText'],
         trigger_migration,
         status='queued' if trigger_migration else 'complete',
-        model=OPENROUTER_DEFAULT_MODEL,
+        model=_active_ai_model(),
         prompt_version=prompt_version,
     )
 
@@ -1432,7 +2379,7 @@ def regenerate():
         'lineage': '',
         'warnings': [],
         'promptVersion': prompt_version,
-        'model': OPENROUTER_DEFAULT_MODEL,
+        'model': _active_ai_model(),
         'status': 'queued' if trigger_migration else 'complete',
     }
 
@@ -1450,6 +2397,7 @@ def regenerate():
                         'generationPlan': cached_plan['plan'],
                         'generationPlanText': cached_plan['planText'],
                         'regeneration': structured,
+                        'selectedGenerationMode': generation_mode,
                         'regenerationHistory': load_regeneration_history(session_id),
                     }), 202
 
@@ -1459,7 +2407,7 @@ def regenerate():
                 'sessionId': session_id,
                 'updatedAt': datetime.utcnow().isoformat(),
                 'promptVersion': prompt_version,
-                'model': OPENROUTER_DEFAULT_MODEL,
+                'model': _active_ai_model(),
                 'progress_message': 'Queued...',
                 'last_heartbeat': time.time(),
             }
@@ -1477,6 +2425,7 @@ def regenerate():
             cached_plan,
             input_hash,
             trigger_migration,
+            generation_mode,
         )
         return jsonify({
             'success': True,
@@ -1486,6 +2435,7 @@ def regenerate():
             'generationPlan': cached_plan['plan'],
             'generationPlanText': cached_plan['planText'],
             'regeneration': structured,
+            'selectedGenerationMode': generation_mode,
             'regenerationHistory': load_regeneration_history(session_id),
         }), 202
 
@@ -1496,7 +2446,7 @@ def regenerate():
         edited_text,
         structured,
         status='complete',
-        model=OPENROUTER_DEFAULT_MODEL,
+        model=_active_ai_model(),
         job_id=history_id,
         prompt_version=prompt_version,
     )
@@ -1512,6 +2462,7 @@ def regenerate():
         'regeneration': structured,
         'generationPlan': cached_plan['plan'],
         'generationPlanText': cached_plan['planText'],
+        'selectedGenerationMode': generation_mode,
         'regenerationHistory': load_regeneration_history(session_id),
     })
 
@@ -1580,8 +2531,10 @@ def explain_code():
     code_snippet = data.get('code')
     session_id = data.get('sessionId')
     
-    if not code_snippet or not OPENROUTER_API_KEY:
-        return jsonify({'error': 'No code provided or API key missing'}), 400
+    if not code_snippet:
+        return jsonify({'error': 'No code provided'}), 400
+    if not _has_ai_provider_configured():
+        return jsonify({'error': 'AI provider not configured'}), 503
         
     system_prompt = "You are a Senior Data Engineer. Explain the following DBT SQL code snippet and how it relates to typical QlikView logic (LOAD, RESIDENT, etc). Keep it concise and technical."
     prompt = f"Please explain this code snippet:\n\n```sql\n{code_snippet}\n```"
@@ -1615,8 +2568,8 @@ def chat_refine():
 
     if not user_message:
         return jsonify({'error': 'No message provided'}), 400
-    if not OPENROUTER_API_KEY:
-        return jsonify({'error': 'OpenRouter API key not configured'}), 503
+    if not _has_ai_provider_configured():
+        return jsonify({'error': 'AI provider not configured'}), 503
 
     bundle = build_session_bundle(session_id) if session_id else None
     if not bundle:
@@ -1684,6 +2637,7 @@ Output format:
             )
             repaired_struct = parse_migration_response(repaired_raw)
             if repaired_struct.get('sql'):
+                repaired_struct['sql'] = finalize_generated_sql(repaired_struct['sql']) if dialect != 'powerbi' else repaired_struct['sql']
                 print(f"✅ [Senior AI/ML Agent] Chat Refinement Self-Repair completed successfully!")
                 structured = repaired_struct
                 structured['warnings'] = structured.get('warnings', [])
@@ -1691,8 +2645,9 @@ Output format:
         except Exception as repair_err:
             print(f"❌ [Senior AI/ML Agent] Chat Refinement Self-Repair failed: {repair_err}. Falling back to proposer draft.")
     structured['promptVersion'] = PROMPT_VERSION
-    structured['model'] = OPENROUTER_DEFAULT_MODEL
+    structured['model'] = _active_ai_model()
     structured['status'] = 'complete'
+    structured['sql'] = finalize_generated_sql(structured.get('sql') or '') if dialect != 'powerbi' else (structured.get('sql') or '')
 
     # Normalise description
     structured['description'] = normalize_sql_description(
@@ -1709,7 +2664,7 @@ Output format:
         current_desc,
         structured,
         status='complete',
-        model=OPENROUTER_DEFAULT_MODEL,
+        model=_active_ai_model(),
         prompt_version=PROMPT_VERSION,
     )
 
@@ -1734,8 +2689,8 @@ def chat_refine_stream():
 
     if not user_message:
         return jsonify({'error': 'No message provided'}), 400
-    if not OPENROUTER_API_KEY:
-        return jsonify({'error': 'OpenRouter API key not configured'}), 503
+    if not _has_ai_provider_configured():
+        return jsonify({'error': 'AI provider not configured'}), 503
 
     bundle = build_session_bundle(session_id) if session_id else None
     if not bundle:
@@ -1772,20 +2727,20 @@ Output format:
     def generate():
         full_content = []
         try:
-            for token in call_openrouter_chat_stream(
-                api_key=OPENROUTER_API_KEY,
-                model=OPENROUTER_DEFAULT_MODEL,
-                prompt=full_prompt,
+            for token in call_openrouter(
+                full_prompt,
                 system_prompt=system_prompt,
                 max_tokens=4096,
                 temperature=0,
                 top_p=1,
+                stream=True,
             ):
                 full_content.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
 
             raw = ''.join(full_content)
             structured = parse_migration_response(raw)
+            structured['sql'] = finalize_generated_sql(structured.get('sql') or '') if dialect != 'powerbi' else (structured.get('sql') or '')
 
             # Validation + repair
             validation_issues = issues_to_strings(validate_migration_sql(structured['sql'], cached_plan['plan'], dialect=dialect))
@@ -1804,13 +2759,15 @@ Output format:
                     )
                     repaired_struct = parse_migration_response(repaired_raw)
                     if repaired_struct.get('sql'):
+                        repaired_struct['sql'] = finalize_generated_sql(repaired_struct['sql']) if dialect != 'powerbi' else repaired_struct['sql']
                         structured = repaired_struct
                 except Exception:
                     pass
 
             structured['promptVersion'] = PROMPT_VERSION
-            structured['model'] = OPENROUTER_DEFAULT_MODEL
+            structured['model'] = _active_ai_model()
             structured['status'] = 'complete'
+            structured['sql'] = finalize_generated_sql(structured.get('sql') or '') if dialect != 'powerbi' else (structured.get('sql') or '')
             structured['description'] = normalize_sql_description(
                 structured.get('description') or current_desc,
                 cached_plan['plan'],
@@ -1820,7 +2777,7 @@ Output format:
             maybe_store_regeneration_state(
                 session_id, file_id, current_sql, current_desc,
                 structured, status='complete',
-                model=OPENROUTER_DEFAULT_MODEL,
+                model=_active_ai_model(),
                 prompt_version=PROMPT_VERSION,
             )
 
@@ -1865,13 +2822,16 @@ def serve_static(path):
     return send_from_directory(app.static_folder, 'index.html')
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
     print("QVF Decoder - API Server")
     print("http://localhost:5000")
     print(f".env path: {_env_path}")
-    if OPENROUTER_API_KEY:
-        print(f"OpenRouter API key detected (starts with: {OPENROUTER_API_KEY[:12]}...)")
+    provider = _selected_ai_provider()
+    model = _active_ai_model(provider)
+    if _has_ai_provider_configured(provider):
+        print(f"AI provider configured: {provider} / {model}")
     else:
-        print("WARNING: No OpenRouter API key detected â€” AI migration will not work.")
+        print("WARNING: No AI provider configured - AI migration will not work.")
         print(f"  Create a .env file at: {_env_path}")
-        print("  Add: OPENROUTER_API_KEY=sk-or-v1-...")
-    app.run(debug=True, port=5000)
+        print("  Example: AI_PROVIDER=gemini and GEMINI_API_KEY=...")
+    app.run(debug=True, port=5000, use_reloader=False)

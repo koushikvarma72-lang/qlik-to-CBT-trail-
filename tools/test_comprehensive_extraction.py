@@ -9,9 +9,9 @@ Demonstrates the enhanced extraction capabilities with sample data.
 
 import json
 import sys
-from qvf_comprehensive_extractor import enhance_metadata_with_comprehensive_extraction
-from qvf_script_parser import parse_qlik_load_script
-from qvf_advanced_extractor import extract_advanced_metadata
+from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
+from backend.extraction.qlik_script_parser import parse_qlik_load_script
+from backend.extraction.advanced_qvf_extractor import extract_advanced_metadata
 
 
 def create_sample_metadata():

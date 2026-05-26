@@ -5,6 +5,26 @@
 
 const API_BASE = '/api';
 
+async function parseApiResponse(res, fallbackMessage) {
+  const text = await res.text();
+  let payload = {};
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { error: text };
+    }
+  }
+
+  if (!res.ok) {
+    const statusMessage = `${res.status}${res.statusText ? ` ${res.statusText}` : ''}`;
+    throw new Error(payload.error || `${fallbackMessage}: ${statusMessage}`);
+  }
+
+  return payload;
+}
+
 export const api = {
   /**
    * Upload a QVF file
@@ -24,12 +44,7 @@ export const api = {
       body: formData,
     });
 
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.error || 'Upload failed');
-    }
-
-    return res.json();
+    return parseApiResponse(res, 'Upload failed');
   },
 
   /**
@@ -53,7 +68,7 @@ export const api = {
    * @param {string} editedText
    * @returns {Promise<Object>} Regenerated output
    */
-  async regenerate(sessionId, editedSql, editedText, triggerMigration = false, regeneratedSql = '', regeneratedText = '', dialect = 'dbt') {
+  async regenerate(sessionId, editedSql, editedText, triggerMigration = false, regeneratedSql = '', regeneratedText = '', dialect = 'dbt', generationMode = 'auto') {
     const res = await fetch(`${API_BASE}/regenerate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -64,7 +79,8 @@ export const api = {
         triggerMigration,
         regeneratedSql,
         regeneratedText,
-        dialect
+        dialect,
+        generationMode
       }),
     });
 

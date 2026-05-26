@@ -6,7 +6,7 @@ import time
 import requests
 from flask import jsonify, request
 
-from backend.openrouter_client import AIClientError
+from backend.integrations.openrouter_client import AIClientError
 
 logger = logging.getLogger(__name__)
 

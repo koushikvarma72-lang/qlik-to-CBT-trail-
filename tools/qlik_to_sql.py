@@ -1,5 +1,5 @@
-from qvf_extractor import extract_model_from_script
-from sql_generation import extract_sql_generation_plan
+from backend.extraction.qvf_runtime import extract_model_from_script
+from backend.migration.sql_generation import extract_sql_generation_plan
 import re
 
 

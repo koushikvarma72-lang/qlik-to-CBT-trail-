@@ -31,7 +31,7 @@ GET  /api/feedback/summary      — aggregate stats across all sessions
 
 Usage
 -----
-    from feedback import register_feedback_routes, ensure_feedback_table
+    from backend.feedback_routes import register_feedback_routes, ensure_feedback_table
     ensure_feedback_table(get_db)
     register_feedback_routes(app, get_db, call_ai=call_openrouter)
 """

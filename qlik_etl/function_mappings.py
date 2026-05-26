@@ -17,4 +17,7 @@ FUNCTION_MAPPINGS = {
     'Len': 'LENGTH',
     'Upper': 'UPPER',
     'Lower': 'LOWER',
+    # Month() returns abbreviated names in Qlik ("Jan", "Feb").
+    # MONTHNAME() returns full names ("January") — use TO_CHAR with 'Mon' format instead.
+    # NOTE: the dialect layer handles Month() specially via TO_CHAR(expr, 'Mon').
 }

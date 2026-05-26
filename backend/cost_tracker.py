@@ -5,8 +5,7 @@ Token usage and estimated cost tracking per session and per model.
 
 Architectural role
 ------------------
-Every call through ai_client.call_openrouter_chat() that touches the OpenRouter
-API should record:
+Every call through the configured AI provider should record:
   - prompt tokens (estimated from character count if the API doesn't return them)
   - completion tokens
   - model name
@@ -30,7 +29,7 @@ Add / update entries when models change.
 
 Usage
 -----
-    from cost_tracker import CostTracker
+    from backend.cost_tracker import CostTracker
 
     tracker = CostTracker()
 

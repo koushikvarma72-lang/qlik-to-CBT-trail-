@@ -391,7 +391,7 @@ Achieves **95-100% reconstruction fidelity** through:
 
 ### Basic Usage
 ```python
-from qvf_comprehensive_extractor import enhance_metadata_with_comprehensive_extraction
+from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
 
 result = enhance_metadata_with_comprehensive_extraction(
     metadata_json,      # From associations.json
@@ -410,8 +410,8 @@ completeness = result['completeness']
 
 ### Advanced Usage
 ```python
-from qvf_script_parser import parse_qlik_load_script
-from qvf_advanced_extractor import extract_advanced_metadata
+from backend.extraction.qlik_script_parser import parse_qlik_load_script
+from backend.extraction.advanced_qvf_extractor import extract_advanced_metadata
 
 # Parse load script
 script_analysis = parse_qlik_load_script(script_text)

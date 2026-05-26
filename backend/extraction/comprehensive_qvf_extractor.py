@@ -27,8 +27,8 @@ from collections import defaultdict
 
 # Import advanced extraction modules
 try:
-    from backend.qlik_script_parser import parse_qlik_load_script
-    from backend.advanced_qvf_extractor import extract_advanced_metadata, ExpressionPreserver
+    from backend.extraction.qlik_script_parser import parse_qlik_load_script
+    from backend.extraction.advanced_qvf_extractor import extract_advanced_metadata, ExpressionPreserver
 except ImportError:
     # Fallback if imports fail
     def parse_qlik_load_script(text):

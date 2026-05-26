@@ -3,7 +3,7 @@ import io, json, os, sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.path.insert(0, '.')
 
-from qvf_extractor import extract_from_binary_qvf, generate_script_from_inferred_model
+from backend.extraction.qvf_runtime import extract_from_binary_qvf, generate_script_from_inferred_model
 
 # Auto-find the most recently uploaded QVF
 uploads = os.path.join(os.path.dirname(__file__), 'uploads')

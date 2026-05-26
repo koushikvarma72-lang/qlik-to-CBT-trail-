@@ -22,10 +22,19 @@ htmlcov/
 # Database
 *.db
 *.sqlite3
+*.db-journal
+*.db.broken_*
 
 # Uploads and User Content
 uploads/
+backend/uploads/
+yourfile_extract_tmp/
 *.qvf
+*.zip
+!samples/*.zip
+
+# Build and cache output
+frontend/dist/
 
 # Logs
 *.log

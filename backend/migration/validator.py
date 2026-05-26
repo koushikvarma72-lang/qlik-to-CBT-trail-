@@ -17,10 +17,14 @@ Passes
 3. Ref Integrity – {{ ref(...) }} calls resolve to known staging models
 4. Dialect       – dialect-specific keyword checks (dbt, powerbi, bigquery…)
 5. Security      – blocks dangerous patterns (DROP, TRUNCATE, shell ops)
+6. Qlik Semantics – text-vs-numeric comparisons, raw YYYYMM in date fns,
+                    SELECT * in CTEs, known source-data typos
+7. dbt Config    – warns when {{ config(...) }} block is missing
+8. Associative   – MONTHNAME() full-name mismatch, missing dimension joins
 
 Usage
 -----
-    from migration_validator import validate_migration_sql, ValidationIssue
+    from backend.migration.validator import validate_migration_sql, ValidationIssue
 
     issues = validate_migration_sql(sql, plan, dialect='dbt')
     for issue in issues:
@@ -71,6 +75,25 @@ def _find_line(sql: str, pattern: re.Pattern) -> Optional[int]:
     return None
 
 
+def _blank_preserving_lines(text: str) -> str:
+    return ''.join('\n' if ch == '\n' else ' ' for ch in text)
+
+
+def _mask_sql_comments_and_strings(sql: str) -> str:
+    """Blank comments and string literals while preserving offsets/line numbers."""
+    if not sql:
+        return sql
+
+    def blank(match: re.Match) -> str:
+        return _blank_preserving_lines(match.group(0))
+
+    masked = re.sub(r'/\*[\s\S]*?\*/', blank, sql)
+    masked = re.sub(r'--[^\n\r]*', blank, masked)
+    masked = re.sub(r"'(?:''|[^'])*'", blank, masked)
+    masked = re.sub(r'"(?:""|[^"])*"', blank, masked)
+    return masked
+
+
 # ─── Pass 1 — Structural ─────────────────────────────────────────────────────
 
 _BARE_DDL = re.compile(
@@ -90,9 +113,11 @@ def _pass_structural(sql: str) -> List[ValidationIssue]:
         issues.append(ValidationIssue('error', 'EMPTY_SQL', 'Generated SQL is empty.'))
         return issues
 
+    executable_sql = _mask_sql_comments_and_strings(sql)
+
     # Balanced parentheses
     depth = 0
-    for i, ch in enumerate(sql):
+    for i, ch in enumerate(executable_sql):
         if ch == '(':
             depth += 1
         elif ch == ')':
@@ -114,7 +139,7 @@ def _pass_structural(sql: str) -> List[ValidationIssue]:
         ))
 
     # Bare DDL
-    for m in _BARE_DDL.finditer(sql):
+    for m in _BARE_DDL.finditer(executable_sql):
         line = sql[:m.start()].count('\n') + 1
         issues.append(ValidationIssue(
             'error', 'BARE_DDL',
@@ -124,8 +149,8 @@ def _pass_structural(sql: str) -> List[ValidationIssue]:
         ))
 
     # Shell operators
-    if _SHELL_OPS.search(sql):
-        line = _find_line(sql, _SHELL_OPS)
+    if _SHELL_OPS.search(executable_sql):
+        line = _find_line(executable_sql, _SHELL_OPS)
         issues.append(ValidationIssue(
             'error', 'SHELL_OPERATOR',
             'Shell operator or subshell syntax detected in SQL.',
@@ -196,6 +221,47 @@ def _pass_ref_integrity(sql: str, known_staging_models: Optional[List[str]] = No
     return issues
 
 
+def _extract_exact_source_name(value: str) -> str:
+    source = str(value or '').strip()
+    source = re.sub(r'\s*\([^)]*\)\s*$', '', source, flags=re.IGNORECASE).strip()
+    source = source.strip('[]').strip("'\"").strip()
+    match = re.search(r'([^/\\]+?)(?:\.[A-Za-z0-9_]+)?$', source)
+    return (match.group(1) if match else source).strip()
+
+
+def _pass_source_name_preservation(sql: str, plan: list) -> List[ValidationIssue]:
+    """Preserve exact source table names unless an explicit dbt mapping exists."""
+    issues: List[ValidationIssue] = []
+    if not plan:
+        return issues
+
+    expected = set()
+    for item in plan or []:
+        for source in item.get('source_tables') or []:
+            exact = _extract_exact_source_name(source)
+            if exact:
+                expected.add(exact)
+
+    actual = set(_SOURCE_CALL.findall(sql or ''))
+    for exact in sorted(expected):
+        if '-' not in exact:
+            continue
+        underscored = exact.replace('-', '_')
+        if underscored in actual and exact not in actual:
+            line = _find_line(sql, re.compile(re.escape(underscored)))
+            issues.append(ValidationIssue(
+                'error',
+                'SOURCE_TABLE_RENAMED',
+                f'Source table "{exact}" was referenced as "{underscored}".',
+                line=line,
+                suggestion=(
+                    f"Use source('raw', '{exact}') unless source.yml explicitly maps "
+                    f"'{underscored}' to the original Qlik/source table."
+                ),
+            ))
+    return issues
+
+
 # ─── Pass 4 — Dialect ─────────────────────────────────────────────────────────
 
 _DIALECT_RULES: dict[str, List[tuple]] = {
@@ -249,8 +315,9 @@ _SECURITY_PATTERNS = [
 
 def _pass_security(sql: str) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
+    executable_sql = _mask_sql_comments_and_strings(sql)
     for pattern, code, message in _SECURITY_PATTERNS:
-        m = pattern.search(sql)
+        m = pattern.search(executable_sql)
         if m:
             line = sql[:m.start()].count('\n') + 1
             issues.append(ValidationIssue('error', code, message, line=line))
@@ -356,6 +423,7 @@ def _pass_qlik_semantics(sql: str) -> List[ValidationIssue]:
 # ─── Pass 7 — dbt model config ────────────────────────────────────────────────
 
 _DBT_CONFIG_BLOCK = re.compile(r'\{\{\s*config\s*\(', re.IGNORECASE)
+_MALFORMED_DBT_CONFIG_BLOCK = re.compile(r'(?<!\{)\{\s*config\s*\(|\bconfig\s*\([^)]*\)\s*\}(?!\})', re.IGNORECASE)
 
 
 def _pass_dbt_config(sql: str, dialect: str) -> List[ValidationIssue]:
@@ -363,14 +431,126 @@ def _pass_dbt_config(sql: str, dialect: str) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
     if dialect.lower() not in ('dbt', 'snowflake', 'bigquery', 'databricks', 'redshift', 'postgres'):
         return issues
+    malformed = _MALFORMED_DBT_CONFIG_BLOCK.search(sql)
+    if malformed:
+        issues.append(ValidationIssue(
+            'error', 'MALFORMED_DBT_CONFIG',
+            'dbt config block uses invalid Jinja braces.',
+            line=sql[:malformed.start()].count('\n') + 1,
+            suggestion="Use exactly: {{ config(materialized='table', tags=['qlik_migration']) }}",
+        ))
     if not _DBT_CONFIG_BLOCK.search(sql):
         issues.append(ValidationIssue(
-            'info', 'MISSING_DBT_CONFIG',
+            'error', 'MISSING_DBT_CONFIG',
             'No {{ config(...) }} block found in the dbt model.',
             suggestion=(
                 "Add a config block at the top, e.g.:\n"
-                "{{ config(materialized='table', tags=['migration']) }}"
+                "{{ config(materialized='table', tags=['qlik_migration']) }}"
             ),
+        ))
+    return issues
+
+
+# ─── Pass 8 — Qlik associative model / missing joins ─────────────────────────
+
+# Detect MONTHNAME() which returns full names, not Qlik-compatible abbreviated names
+_MONTHNAME_CALL = re.compile(r'\bMONTHNAME\s*\(', re.IGNORECASE)
+
+# Detect a final SELECT that reads from a single CTE with no JOINs —
+# a sign that dimension tables defined earlier are silently dropped.
+_FINAL_SELECT_NO_JOIN = re.compile(
+    r'SELECT\s+\*\s+FROM\s+(\w+)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _pass_associative_model(sql: str) -> List[ValidationIssue]:
+    """Warn about patterns that indicate the Qlik associative model wasn't translated."""
+    issues: List[ValidationIssue] = []
+
+    # 1. MONTHNAME() produces full names, not Qlik-compatible abbreviated names
+    for m in _MONTHNAME_CALL.finditer(sql):
+        line = sql[:m.start()].count('\n') + 1
+        issues.append(ValidationIssue(
+            'warning', 'MONTHNAME_FULL_NAME',
+            'MONTHNAME() returns full month names ("January") but Qlik Month() returns '
+            'abbreviated names ("Jan"). This will break downstream joins or filters.',
+            line=line,
+            suggestion="Replace MONTHNAME(expr) with TO_CHAR(expr, 'Mon') to match Qlik behaviour.",
+        ))
+
+    # 2. Final SELECT reads from one CTE with no JOINs while multiple CTEs are defined.
+    # Only flag when the ENTIRE model has zero JOINs — if any CTE body contains a JOIN
+    # the developer has already thought about relationships.
+    cte_count = len(re.findall(r'\bAS\s*\(', sql, re.IGNORECASE))
+    final_match = _FINAL_SELECT_NO_JOIN.search(sql.rstrip())
+    if final_match and cte_count > 2:
+        has_any_join = bool(re.search(r'\bJOIN\b', sql, re.IGNORECASE))
+        if not has_any_join:
+            final_cte = final_match.group(1)
+            issues.append(ValidationIssue(
+                'warning', 'MISSING_DIMENSION_JOINS',
+                f'Final SELECT reads only from `{final_cte}` with no JOINs anywhere in the model, '
+                f'but {cte_count} CTEs are defined. In Qlik all tables join automatically via '
+                f'shared field names — in SQL every relationship must be written explicitly.',
+                suggestion=(
+                    f'Add a final_model CTE that LEFT JOINs every dimension to `{final_cte}` '
+                    f'on their shared key fields. Use LEFT JOIN so no fact rows are dropped. '
+                    f'If a join key is uncertain, add a -- TODO: verify join key comment.'
+                ),
+            ))
+
+
+    # 3. Generic one-shot quality gate: multiple CTEs should produce a final_model/final_mart.
+    cte_names = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(', sql, re.IGNORECASE)
+    cte_set = {c.lower() for c in cte_names}
+    if len(cte_set) >= 3 and not (cte_set & {'final_model', 'final_mart'}):
+        issues.append(ValidationIssue(
+            'error', 'FINAL_MODEL_MISSING',
+            'Multiple CTEs were generated but no final_model/final_mart CTE exists.',
+            suggestion='Create final_model and end with SELECT * FROM final_model.',
+        ))
+
+    # 4. Generic unused CTE check. This catches one-shot outputs that create useful CTEs
+    # but never route them into the final mart. It is not tied to any particular Qlik file.
+    if len(cte_set) >= 3:
+        reference_counts = {c: 0 for c in cte_set}
+        for m in re.finditer(r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\b', sql, re.IGNORECASE):
+            ref = m.group(1).lower()
+            if ref in reference_counts:
+                reference_counts[ref] += 1
+        unused = sorted(c for c in cte_set if c not in {'final_model', 'final_mart'} and reference_counts.get(c, 0) == 0)
+        if unused:
+            issues.append(ValidationIssue(
+                'warning', 'UNREACHABLE_CTE_CREATED_NOT_USED',
+                'CTEs are created but never referenced downstream: ' + ', '.join(unused) + '.',
+                suggestion='Join these CTEs into final_model, feed them into another CTE, or remove them.',
+            ))
+
+    return issues
+
+
+# ─── Pass 9 — Schema Contract ────────────────────────────────────────────────
+
+def _pass_schema_contract(sql: str) -> List[ValidationIssue]:
+    """Verify that a commented schema contract is present at the top of the SQL."""
+    issues: List[ValidationIssue] = []
+    # Look for commented headers indicating SOURCE FIELD REGISTRY, DATE FIELD TYPES, etc.
+    sql_lines = [line.strip().upper() for line in sql.splitlines()[:25]]
+    has_registry = any('SOURCE FIELD REGISTRY' in line or 'SOURCE_FIELD_REGISTRY' in line for line in sql_lines)
+    has_date_types = any('DATE FIELD TYPES' in line or 'DATE_FIELD_TYPES' in line for line in sql_lines)
+    has_grain = any('ISLAND TABLE GRAINS' in line or 'ISLAND_TABLE_GRAINS' in line for line in sql_lines)
+    
+    if not (has_registry and has_date_types and has_grain):
+        issues.append(ValidationIssue(
+            'warning', 'MISSING_SCHEMA_CONTRACT',
+            'No Schema Contract block found at the top of the SQL. A contract block must comment SOURCE FIELD REGISTRY, DATE FIELD TYPES, and ISLAND TABLE GRAINS.',
+            suggestion=(
+                "Add a contract block at the top of your model, e.g.:\n"
+                "-- SOURCE FIELD REGISTRY\n"
+                "-- DATE FIELD TYPES\n"
+                "-- ISLAND TABLE GRAINS"
+            )
         ))
     return issues
 
@@ -399,10 +579,13 @@ def validate_migration_sql(
 
     all_issues.extend(_pass_plan_coverage(sql, plan or []))
     all_issues.extend(_pass_ref_integrity(sql, known_staging_models))
+    all_issues.extend(_pass_source_name_preservation(sql, plan or []))
     all_issues.extend(_pass_dialect(sql, dialect))
     all_issues.extend(_pass_security(sql))
     all_issues.extend(_pass_qlik_semantics(sql))
     all_issues.extend(_pass_dbt_config(sql, dialect))
+    all_issues.extend(_pass_associative_model(sql))
+    all_issues.extend(_pass_schema_contract(sql))
 
     # Sort: errors first, then warnings, then info
     _order = {'error': 0, 'warning': 1, 'info': 2}

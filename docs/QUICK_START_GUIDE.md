@@ -7,25 +7,25 @@
 1. **Verify Installation**
    ```bash
    cd qvf_decoder
-   python -m py_compile qvf_comprehensive_extractor.py qvf_script_parser.py qvf_advanced_extractor.py
+   python -m py_compile backend/extraction/comprehensive_qvf_extractor.py backend/extraction/qlik_script_parser.py backend/extraction/advanced_qvf_extractor.py
    ```
 
 2. **Run Tests**
    ```bash
-   python test_comprehensive_extraction.py
+   python tools/test_comprehensive_extraction.py
    ```
 
 3. **Check Server Integration**
    ```python
    from server import process_single_qvf
-   from qvf_comprehensive_extractor import enhance_metadata_with_comprehensive_extraction
+   from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
    ```
 
 ### Basic Usage
 
 ```python
-from qvf_comprehensive_extractor import enhance_metadata_with_comprehensive_extraction
-from qvf_script_parser import parse_qlik_load_script
+from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
+from backend.extraction.qlik_script_parser import parse_qlik_load_script
 
 # Extract comprehensive metadata
 result = enhance_metadata_with_comprehensive_extraction(
@@ -50,7 +50,7 @@ print(f"Data sources: {len(script_info['dataSources'])}")
 
 ```python
 # Get detailed expression analysis
-from qvf_advanced_extractor import ExpressionPreserver
+from backend.extraction.advanced_qvf_extractor import ExpressionPreserver
 
 preserver = ExpressionPreserver()
 expr = "Sum({<Year={2025}>} Amount)"
@@ -63,7 +63,7 @@ print(f"References: {fields}")
 print(f"Set analysis: {components}")
 
 # Get visualization details
-from qvf_advanced_extractor import VisualizationExtractor
+from backend.extraction.advanced_qvf_extractor import VisualizationExtractor
 
 viz_extractor = VisualizationExtractor()
 visualizations = viz_extractor.extract_visualizations_comprehensive(metadata)

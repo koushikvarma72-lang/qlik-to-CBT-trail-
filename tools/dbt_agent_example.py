@@ -1,4 +1,4 @@
-﻿"""
+"""
 dbt_agent_example.py
 =====================
 End-to-end worked example: Genmab Clinical Trials QlikView → dbt Cloud
@@ -317,7 +317,7 @@ MOCK_BUNDLE = {
 # SECTION 3 — dbt Package Agent Walkthrough
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# AGENT: dbt_package_agent.py
+# AGENT: backend.integrations.dbt_package_routes
 # WHAT: Takes the session bundle and produces a downloadable dbt project ZIP.
 # WHY: A data engineer who has never touched Qlik can open the ZIP, run
 #      `dbt deps && dbt run`, and have a working Snowflake model immediately.
@@ -332,7 +332,7 @@ def demo_package_agent() -> dict:
     Returns a dict representing the generated project structure.
     """
     try:
-        from dbt_package_agent import build_schema_yml, _slugify, _infer_column_type
+        from backend.integrations.dbt_package_routes import build_schema_yml, _slugify, _infer_column_type
     except ImportError:
         # Flask not installed in standalone mode — use inline stubs
         def _slugify(name):
@@ -526,10 +526,10 @@ def demo_cloud_agent_planning(
     print("[3/4] AI plan received and sanitised")
     print(f"      → Upgraded commands: {ai_plan['commands']}")
 
-    # ── Validation pass (migration_validator.validate_migration_sql) ──────────
+    # ── Validation pass (backend.migration.validator.validate_migration_sql) ──
     # AIML NEW: This is the improvement we added — the validator now catches
     #           dialect issues and missing plan models BEFORE the job runs.
-    from migration_validator import validate_migration_sql, issues_to_strings
+    from backend.migration.validator import validate_migration_sql, issues_to_strings
     issues = validate_migration_sql(
         GENERATED_DBT_SQL,
         plan=MOCK_BUNDLE["cached_plan"]["plan"],
@@ -570,7 +570,7 @@ def demo_full_flow():
     1.  User uploads ClinicalTrials_Dashboard.qvf
     2.  qvf_extractor extracts tables + script
     3.  AI migration generates the dbt SQL
-    4.  migration_validator validates the SQL (NEW)
+    4.  backend.migration.validator validates the SQL (NEW)
     5.  dbt Package Agent builds the project ZIP
     6.  dbt Cloud Agent plans + executes the run
     7.  cost_tracker records token usage (NEW)
@@ -617,9 +617,9 @@ def demo_full_flow():
 
     # ── Step 4: Validation ────────────────────────────────────────────────────
     print(f"\n{DIVIDER}")
-    print("STEP 4: Multi-Pass SQL Validation (migration_validator — NEW)")
+    print("STEP 4: Multi-Pass SQL Validation (backend.migration.validator — NEW)")
     print(DIVIDER)
-    from migration_validator import validate_migration_sql
+    from backend.migration.validator import validate_migration_sql
     issues = validate_migration_sql(
         GENERATED_DBT_SQL,
         plan=MOCK_BUNDLE["cached_plan"]["plan"],
@@ -686,9 +686,9 @@ def demo_full_flow():
 
     # ── Step 7: Cost Tracking ─────────────────────────────────────────────────
     print(f"\n{DIVIDER}")
-    print("STEP 7: Cost Tracking  (cost_tracker.CostTracker — NEW)")
+    print("STEP 7: Cost Tracking  (backend.cost_tracker.CostTracker — NEW)")
     print(DIVIDER)
-    from cost_tracker import CostTracker
+    from backend.cost_tracker import CostTracker
     tracker = CostTracker()
     tracker.record(SESSION_ID, "openai/gpt-4o-mini", "migration",
                    prompt_text=QLIK_SCRIPT, completion_text=GENERATED_DBT_SQL)
@@ -758,13 +758,13 @@ QVF DECODER — Complete Agent Architecture
   ┌──────────────────────▼──────────────────────────────────────┐
   │  FLASK SERVER  (server.py)                                   │
   │                                                             │
-  │  /api/upload        → qvf_extractor.extract_qvf()           │
-  │  /api/regenerate    → sql_generation.request_migration()     │
+  │  /api/upload        → backend.extraction.qvf_runtime         │
+  │  /api/regenerate    → backend.migration.sql_generation       │
   │  /api/chat          → iterative SQL refinement              │
-  │  /api/download      → dbt_package_agent  ◄── NEW: staging   │
-  │  /api/dbt-cloud/*   → dbt_cloud_agent   ◄── NEW: retries    │
-  │  /api/cost/*        → cost_tracker       ◄── BRAND NEW      │
-  │  /api/feedback/*    → feedback.py        ◄── BRAND NEW      │
+  │  /api/download      → backend.integrations.dbt_package_routes│
+  │  /api/dbt-cloud/*   → backend.integrations.dbt_cloud_routes  │
+  │  /api/cost/*        → backend.cost_tracker                   │
+  │  /api/feedback/*    → backend.feedback_routes                │
   │                                                             │
   │  SQL_PLAN_CACHE = SessionPlanCache(LRU)  ◄── FIXED          │
   │  COST_TRACKER   = CostTracker()          ◄── BRAND NEW      │
@@ -772,7 +772,7 @@ QVF DECODER — Complete Agent Architecture
      │                   │
      ▼                   ▼
   ┌──────────┐    ┌──────────────────────────────────────────────┐
-  │ SQLite   │    │  AI LAYER  (ai_client.py → OpenRouter)        │
+  │ SQLite   │    │  AI LAYER  (backend.integrations.*)           │
   │          │    │                                              │
   │ sessions │    │  call_openrouter_chat()                      │
   │ files    │    │    • json=payload  ← FIXED (was data=dumps)  │
@@ -782,7 +782,7 @@ QVF DECODER — Complete Agent Architecture
                   └──────────────────┬───────────────────────────┘
                                      │
                   ┌──────────────────▼───────────────────────────┐
-                  │  VALIDATION LAYER  (migration_validator.py)   │
+                  │  VALIDATION LAYER  (backend.migration.validator)│
                   │  ◄── BRAND NEW                               │
                   │                                              │
                   │  Pass 1 — Structural (parens, DDL, shell)     │

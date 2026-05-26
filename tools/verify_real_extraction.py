@@ -9,7 +9,7 @@ import json
 import sqlite3
 import sys
 import os
-from qvf_comprehensive_extractor import enhance_metadata_with_comprehensive_extraction
+from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
 
 def verify_real_extraction():
     print("=" * 80)

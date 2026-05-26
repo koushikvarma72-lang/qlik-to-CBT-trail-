@@ -2,9 +2,9 @@ import json
 import unittest
 from unittest.mock import Mock
 
-from backend.qlik_script_parser import parse_qlik_load_script
-from backend.qvf_runtime import _collect_decoded_script_candidates, _section_might_contain_script
-from backend.sql_migration import extract_sql_generation_plan, render_sql_from_load_plan, request_migration, request_migration_with_validation, deduplicate_ctes
+from backend.extraction.qlik_script_parser import parse_qlik_load_script
+from backend.extraction.qvf_runtime import _collect_decoded_script_candidates, _section_might_contain_script
+from backend.migration.sql_generation import extract_sql_generation_plan, render_sql_from_load_plan, request_migration, request_migration_with_validation, deduplicate_ctes, validate_generated_sql
 
 
 class LoadOnlySqlGenerationTests(unittest.TestCase):
@@ -212,7 +212,7 @@ class LoadOnlySqlGenerationTests(unittest.TestCase):
         self.assertIn("WHERE Country = 'US'", sql)
         self.assertIn("GROUP BY CustomerID", sql)
 
-    def test_request_migration_falls_back_to_deterministic_sql_when_ai_drifts(self):
+    def test_request_migration_stops_on_stub_ai_output(self):
         script = """
         SalesSummary:
         LOAD
@@ -231,10 +231,10 @@ class LoadOnlySqlGenerationTests(unittest.TestCase):
         ai = Mock(return_value=bad_response)
         result = request_migration_with_validation(ai, script, max_iterations=1)
 
-        self.assertEqual(result['status'], 'retry')
-        self.assertIn("{{ source('raw', 'Sales') }}", result['final_sql'])
-        self.assertIn("WHERE Country = 'US'", result['final_sql'])
-        self.assertIn("GROUP BY CustomerID", result['final_sql'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['final_sql'], '')
+        self.assertIn('stub', result['error'].lower())
+        self.assertFalse(result['used_deterministic_fallback'])
 
     def test_parser_only_counts_load_blocks(self):
         metadata_only = '{"qInfo":{"qId":"XFhtUb","qType":"dimension"},"qDim":{"qFieldDefs":["Sales Rep Name"]}}'
@@ -281,8 +281,9 @@ class LoadOnlySqlGenerationTests(unittest.TestCase):
         """
         deduped = deduplicate_ctes(sql)
         self.assertIn("customers AS (", deduped)
-        self.assertIn("customers_v2 AS (", deduped)
-        self.assertIn("SELECT * FROM customers_v2", deduped)
+        self.assertNotIn("customers_v2 AS (", deduped)
+        issues = validate_generated_sql(deduped)
+        self.assertTrue(any("DUPLICATE_CTE_NAME" in issue for issue in issues), issues)
 
 
 if __name__ == "__main__":
