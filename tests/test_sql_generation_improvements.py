@@ -21,6 +21,7 @@ from backend.migration.sql_generation import (
     _typed_null,
     _translate_qlik_expression_to_sql,
     build_fast_sql_generation_prompt,
+    build_join_contract,
     build_sql_generation_prompt,
     compare_descriptions,
     detect_repair_regressions,
@@ -972,6 +973,64 @@ class TestTypedNulls(unittest.TestCase):
         self.assertNotIn('pre-generation schema contract', combined)
         self.assertNotIn('source field registry', combined)
         self.assertIn('one concise technical paragraph', combined)
+        self.assertIn('### required join contract', combined)
+        self.assertIn('use only these join paths', combined)
+
+    def test_build_join_contract_uses_ir_safe_joins_and_emits_warnings(self):
+        plan = [make_load('FactTable', ['CustKey', 'Item-Branch Key'], source='FactTable.qvd')]
+        script = (
+            "FactTable:\nLOAD CustKey, [Item-Branch Key] FROM [lib://FactTable.qvd] (qvd);\n"
+            "CustomerMap:\nLOAD CustKey, CustKeyAR FROM [lib://CustomerMap.qvd] (qvd);\n"
+            "ARSummary:\nLOAD CustKeyAR, ARAge FROM [lib://ARSummary.qvd] (qvd);\n"
+            "ItemBranchMaster:\nLOAD [Item-Branch Key], [Short Name] FROM [lib://ItemBranchMaster.qvd] (qvd);\n"
+            "ItemMaster:\nLOAD [Short Name], [Product Group] FROM [lib://ItemMaster.qvd] (qvd);"
+        )
+        contract = build_join_contract(plan=plan, qvs_script=script)
+        self.assertIn('JOIN CONTRACT:', contract['text'])
+        self.assertTrue(contract['lines'])
+        self.assertIn('required_aliases', contract)
+        self.assertIn('forbidden_patterns', contract)
+        self.assertEqual(contract['required_aliases'].get('sales_rep_master'), 'srm')
+        self.assertTrue(any('monthlyregionkey only' in rule.lower() for rule in contract['forbidden_patterns']))
+        has_fact_join = any('facttable' in line.lower() for line in contract['lines'])
+        has_fallback = any('no validated safe joins' in line.lower() for line in contract['lines'])
+        self.assertTrue(has_fact_join or has_fallback, contract)
+
+    def test_build_join_contract_fallback_uses_safe_shared_keys(self):
+        plan = [
+            make_load('FactTable_With_Expenses', ['MonthlyRegionKey', 'CustKey'], source='Fact.qvd'),
+            make_load('CustomerMap', ['CustKey', 'CustKeyAR'], source='CustomerMap.qvd'),
+            make_load('Budget', ['MonthlyRegionKey'], source='Budget.qvd'),
+        ]
+        contract = build_join_contract(plan=plan, qvs_script='')
+        text = (contract.get('text') or '').lower()
+        self.assertIn('join contract', text)
+        self.assertTrue(
+            any('metadata_fallback' in line.lower() for line in contract.get('join_lines', []))
+            or any('facttable_with_expenses.custkey' in line.lower() for line in contract.get('join_lines', []))
+            or any('no validated safe joins' in line.lower() for line in contract.get('join_lines', [])),
+            contract,
+        )
+
+    def test_validator_rejects_expenses_join_on_monthly_key_only(self):
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH facttable_with_expenses AS (\n"
+            "  SELECT MonthlyRegionKey, Account FROM {{ source('raw','FactTable') }}\n"
+            "),\n"
+            "expenses AS (\n"
+            "  SELECT MonthlyRegionKey, Account FROM {{ source('raw','Expenses') }}\n"
+            "),\n"
+            "final_model AS (\n"
+            "  SELECT f.MonthlyRegionKey\n"
+            "  FROM facttable_with_expenses f\n"
+            "  LEFT JOIN expenses e ON f.MonthlyRegionKey = e.MonthlyRegionKey\n"
+            ")\n"
+            "SELECT * FROM final_model"
+        )
+        issues = validate_generated_sql(sql, dialect='dbt')
+        self.assertTrue(any('INVALID_EXPENSES_JOIN_MONTHLY_ONLY' in i for i in issues), issues)
+        self.assertTrue(needs_sql_repair(issues))
 
     def test_minimum_token_guard_allows_repair_budget(self):
         result = _invoke_ai_text(

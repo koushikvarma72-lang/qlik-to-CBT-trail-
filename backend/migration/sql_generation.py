@@ -323,6 +323,225 @@ def _format_ir_issues_for_sql(issues):
     return formatted
 
 
+def _canonical_table_alias(table_name: str) -> str:
+    """Return stable aliases for high-risk joins to reduce model ambiguity."""
+    name = _safe_cte_name(table_name)
+    preferred = {
+        'customer_map': 'cmap',
+        'customer_master': 'cust',
+        'item_branch_master': 'ibm',
+        'item_master': 'im',
+    }
+    if name in preferred:
+        return preferred[name]
+    parts = [p for p in name.split('_') if p]
+    if not parts:
+        return 't'
+    alias = ''.join(part[0] for part in parts if part[0].isalpha())
+    return alias[:4] or parts[0][:1] or 't'
+
+
+def _normalize_sql_name(name: str) -> str:
+    return re.sub(r'[^a-z0-9_]+', '', str(name or '').strip().strip('[]"').lower())
+
+
+def _plan_table_fields(plan):
+    """Best-effort table -> output fields map from the generation plan."""
+    table_fields = {}
+    for item in plan or []:
+        table = _safe_cte_name(item.get('table') or '')
+        if not table:
+            continue
+        fields = table_fields.setdefault(table, [])
+        for field in item.get('fields') or []:
+            name = _extract_output_column_name(field)
+            if name and name not in fields:
+                fields.append(name)
+    return table_fields
+
+
+def _fallback_join_candidates_from_plan(plan):
+    """Conservative fallback joins from shared-key metadata when IR joins are sparse."""
+    safe_keys = {
+        'monthlyregionkey', 'custkey', 'custkeyar', 'addressnumber',
+        'itembranchkey', 'shortname', 'productgroup', 'sales_rep', 'salesrep',
+    }
+    forbidden_tables = {'expenses', 'expenses_for_fact', 'int_expenses', 'expenses_aggregated', 'int_expenses_aggregated'}
+    table_fields = _plan_table_fields(plan)
+    tables = sorted(table_fields.keys())
+    lines = []
+    warnings = []
+
+    def low_risk_pair(left_table, right_table, key_name):
+        pair = {left_table, right_table}
+        if pair & forbidden_tables:
+            return False
+        if key_name == 'monthlyregionkey':
+            return 'facttable_with_expenses' in pair and bool(pair & {'budget', 'calendar'})
+        if key_name == 'custkey':
+            return 'facttable_with_expenses' in pair and 'customer_map' in pair
+        if key_name == 'custkeyar':
+            return 'customer_map' in pair and bool(pair & {'ar_summary', 'ar_summary_1'})
+        if key_name in {'addressnumber'}:
+            return 'facttable_with_expenses' in pair and 'customer_master' in pair
+        if key_name in {'sales_rep', 'salesrep'}:
+            return 'customer_master' in pair and 'sales_rep_master' in pair
+        if key_name == 'itembranchkey':
+            return 'facttable_with_expenses' in pair and 'item_branch_master' in pair
+        if key_name == 'shortname':
+            return 'item_branch_master' in pair and 'item_master' in pair
+        if key_name == 'productgroup':
+            return 'item_master' in pair and 'product_group_master' in pair
+        return False
+
+    for i, left in enumerate(tables):
+        left_norm = {_normalize_sql_name(f): f for f in table_fields.get(left, [])}
+        for right in tables[i + 1:]:
+            right_norm = {_normalize_sql_name(f): f for f in table_fields.get(right, [])}
+            shared = sorted(set(left_norm.keys()) & set(right_norm.keys()))
+            for key in shared:
+                if key not in safe_keys:
+                    continue
+                if not low_risk_pair(left, right, key):
+                    continue
+                left_key = left_norm[key]
+                right_key = right_norm[key]
+                la = _canonical_table_alias(left)
+                ra = _canonical_table_alias(right)
+                lines.append(
+                    f"- {left}.{left_key} -> {right}.{right_key} | aliases: {left}={la}, {right}={ra} | source: metadata_fallback"
+                )
+    if not lines:
+        warnings.append('FALLBACK_JOIN_CONTRACT_EMPTY: no low-risk shared-key metadata joins found.')
+    return lines, warnings
+
+
+def build_join_contract(plan, qvs_script=''):
+    """Build a deterministic join contract from IR joins only.
+
+    Returns:
+        dict with:
+          - join_lines: prompt-ready allowed join paths
+          - warnings: omitted/unsafe paths and IR caveats
+          - required_aliases: mandatory alias map for known risky dimensions
+          - forbidden_patterns: hard disallowed join patterns
+          - text: compact text block for prompt injection
+    """
+    ir, ir_issues, _, _ = _build_ir_context(plan or [], qvs_script or '')
+    warnings = []
+    if ir_issues:
+        warnings.extend(_format_ir_issues_for_sql(ir_issues))
+
+    required_aliases = {
+        'customer_map': 'cmap',
+        'customer_master': 'cust',
+        'item_branch_master': 'ibm',
+        'item_master': 'im',
+        'sales_rep_master': 'srm',
+    }
+    forbidden_patterns = [
+        'Never join expenses to facttable_with_expenses by MonthlyRegionKey only.',
+        'Never reuse the same alias for different CTEs in final_model.',
+        'Never reference alias.column that is not selected by that alias CTE.',
+    ]
+
+    if not ir or not getattr(ir, 'joins', None):
+        fallback_lines, fallback_warnings = _fallback_join_candidates_from_plan(plan or [])
+        warnings.extend(fallback_warnings)
+        if not fallback_lines:
+            fallback_lines = ['- No validated safe joins; omit uncertain lookup joins.']
+        text = (
+            "JOIN CONTRACT:\n"
+            + "\n".join(fallback_lines)
+            + "\n"
+            + "- No validated join paths were derived from IR.\n"
+            "- Omit uncertain lookup joins and continue with verified model logic only."
+        )
+        if warnings:
+            text += "\n\nJOIN CONTRACT WARNINGS:\n" + "\n".join(f"- {w}" for w in warnings[:8])
+        text += "\n\nALIAS CONTRACT:\n" + "\n".join(
+            f"- {table} = {alias}" for table, alias in required_aliases.items()
+        )
+        text += "\n\nFORBIDDEN PATTERNS:\n" + "\n".join(f"- {rule}" for rule in forbidden_patterns)
+        return {
+            'join_lines': fallback_lines,
+            'lines': fallback_lines,
+            'warnings': warnings,
+            'required_aliases': required_aliases,
+            'forbidden_patterns': forbidden_patterns,
+            'text': text,
+        }
+
+    lines = []
+    seen = set()
+    for join in ir.joins:
+        if not getattr(join, 'safe', False):
+            warnings.append(
+                f"OMITTED_UNSAFE_JOIN: {join.from_table}.{join.left_key} -> "
+                f"{join.to_table}.{join.right_key} ({join.cardinality}; {join.required_action or 'unsafe'})"
+            )
+            continue
+
+        left_table = _safe_cte_name(join.from_table)
+        right_table = _safe_cte_name(join.to_table)
+        left_key = str(join.left_key or '').strip()
+        right_key = str(join.right_key or '').strip()
+        if not (left_table and right_table and left_key and right_key):
+            warnings.append(
+                f"OMITTED_INCOMPLETE_JOIN_SPEC: {join.from_table} -> {join.to_table} (missing key details)"
+            )
+            continue
+
+        left_alias = _canonical_table_alias(left_table)
+        right_alias = _canonical_table_alias(right_table)
+        if getattr(join, 'join_chain', None):
+            chain = [_safe_cte_name(x) for x in (join.join_chain or []) if str(x).strip()]
+            chain_path = " -> ".join([left_table] + chain + [right_table])
+            chain_line = (
+                f"- CHAIN PATH: {chain_path} | terminal key: "
+                f"{left_table}.{left_key} -> {right_table}.{right_key} "
+                f"| aliases: {left_table}={left_alias}, {right_table}={right_alias}"
+            )
+            key = chain_line.lower()
+            if key not in seen:
+                lines.append(chain_line)
+                seen.add(key)
+        else:
+            line = (
+                f"- {left_table}.{left_key} -> {right_table}.{right_key} "
+                f"| aliases: {left_table}={left_alias}, {right_table}={right_alias}"
+            )
+            key = line.lower()
+            if key not in seen:
+                lines.append(line)
+                seen.add(key)
+
+    if not lines:
+        fallback_lines, fallback_warnings = _fallback_join_candidates_from_plan(plan or [])
+        warnings.extend(fallback_warnings)
+        if fallback_lines:
+            lines.extend(fallback_lines)
+        else:
+            lines.append("- No validated safe joins; omit uncertain lookup joins.")
+
+    text = "JOIN CONTRACT:\n" + "\n".join(lines)
+    if warnings:
+        text += "\n\nJOIN CONTRACT WARNINGS:\n" + "\n".join(f"- {w}" for w in warnings[:10])
+    text += "\n\nALIAS CONTRACT:\n" + "\n".join(
+        f"- {table} = {alias}" for table, alias in required_aliases.items()
+    )
+    text += "\n\nFORBIDDEN PATTERNS:\n" + "\n".join(f"- {rule}" for rule in forbidden_patterns)
+
+    return {
+        'join_lines': lines,
+        'lines': lines,  # backward compatibility for existing callers/tests
+        'warnings': warnings,
+        'required_aliases': required_aliases,
+        'forbidden_patterns': forbidden_patterns,
+        'text': text,
+    }
+
+
 def _audit_generated_sql_against_plan(sql_text, plan=None, qvs_script='', dialect='dbt'):
     """Validate source ownership, join keys, grain risks, and UNION shape."""
     issues = validate_generated_sql(sql_text, plan, dialect)
@@ -1506,6 +1725,32 @@ def _alias_relation_map(select_tail: str):
     return alias_map
 
 
+def _validate_duplicate_aliases(sql_text: str):
+    """Flag repeated aliases in the final_model/final SELECT join scope."""
+    issues = []
+    select_scope = _cte_body_for(sql_text, 'final_model') or _cte_body_for(sql_text, 'final_mart') or _final_select_tail(sql_text)
+    pattern = re.compile(
+        r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?',
+        re.IGNORECASE,
+    )
+    reserved = {'on', 'where', 'left', 'right', 'full', 'inner', 'join', 'group', 'order', 'qualify'}
+    aliases = {}
+    for match in pattern.finditer(select_scope or ''):
+        relation = match.group(1)
+        alias = match.group(2) or relation
+        if alias.lower() in reserved:
+            alias = relation
+        alias_key = alias.lower()
+        previous = aliases.get(alias_key)
+        if previous and previous.lower() != relation.lower():
+            issues.append(
+                f'DUPLICATE_ALIAS: alias {alias} is reused for both {previous} and {relation}. '
+                'Use a unique alias for each CTE/relation.'
+            )
+        aliases[alias_key] = relation
+    return issues
+
+
 def _cte_columns_by_name(sql_text: str, names=None):
     names = names or _cte_names(sql_text)
     result = {}
@@ -1554,6 +1799,10 @@ def _validate_alias_column_references(sql_text: str, names):
         if not _column_exists(columns, column):
             issues.append(
                 f'JOIN_KEY_MISSING: alias {match.group(1)} references column "{column}" '
+                f'but CTE {relation} does not expose that column.'
+            )
+            issues.append(
+                f'ALIAS_COLUMN_NOT_FOUND: alias {match.group(1)} references column "{column}" '
                 f'but CTE {relation} does not expose that column.'
             )
     return issues
@@ -1712,8 +1961,19 @@ def validate_candidate_integrity(sql_text: str, plan=None):
                 + '. Join them into final_model, feed them into another CTE, or omit them.'
             )
 
+    issues.extend(_validate_duplicate_aliases(executable_sql))
     issues.extend(_validate_alias_column_references(executable_sql, names))
     issues.extend(_validate_join_key_name_compatibility(executable_sql))
+    has_expenses_join = bool(re.search(
+        r'\bJOIN\s+(?:expenses|expenses_for_fact|int_expenses|expenses_aggregated|int_expenses_aggregated)\b',
+        executable_sql,
+        re.IGNORECASE,
+    ))
+    if has_expenses_join and not _has_expenses_account_join(executable_sql):
+        issues.append(
+            'INVALID_EXPENSES_JOIN_MONTHLY_ONLY: expenses join is missing Account equality; '
+            'never join expenses to facttable_with_expenses by MonthlyRegionKey alone.'
+        )
 
     return issues
 
@@ -1881,6 +2141,7 @@ def validation_issue_category(issue):
         'MISSING_DBT_CONFIG',
         'DIALECT_DBT_IN_POWERBI',
         'UNION_',
+        'DUPLICATE_ALIAS',
         'DUPLICATE_MODEL_COPY',
         'DUPLICATE_CTE_NAME',
         'REPAIR_CTE_SUFFIX_LEAK',
@@ -1894,6 +2155,8 @@ def validation_issue_category(issue):
         'QUOTED_CASE_MISMATCH',
         'INVALID_NULLABLE_OR_JOIN_PREDICATE',
         'INVALID_NULLABLE_ACCOUNT_JOIN_PREDICATE',
+        'INVALID_EXPENSES_JOIN_MONTHLY_ONLY',
+        'ALIAS_COLUMN_NOT_FOUND',
         'WITH APPEARS WITHOUT A FOLLOWING CTE BODY',
         'DOES NOT APPEAR TO CONTAIN A SELECT OR WITH CLAUSE',
         'TRAILING COMMA',
@@ -3094,6 +3357,7 @@ def build_fast_sql_generation_prompt(
     plan = plan if plan is not None else extract_sql_generation_plan(qvs_script)
     plan_text = plan_text if plan_text is not None else format_sql_generation_plan(plan)
     ir, ir_issues, _ir_contract, ir_prompt_summary = _build_ir_context(plan, qvs_script)
+    join_contract = build_join_contract(plan, qvs_script)
     qvs_script = optimize_qvs_for_context(qvs_script, max_chars=12_000)
     target_dialect = (dialect or 'dbt').upper()
 
@@ -3130,12 +3394,23 @@ Core migration rules:
 - final_model must be the only final SELECT source: end exactly with SELECT * FROM final_model.
 - Every CTE you create must either feed another CTE/final_model or be omitted. Do not create unused CTEs.
 - If a lookup/dimension CTE cannot be safely joined due to unclear keys, do not create that CTE. Prefer omitting unsafe lookup CTEs over creating unused CTEs.
+- If no safe join contract exists for a lookup CTE, do not create that CTE.
+- Do not reuse the same table alias for multiple CTEs.
+- Before joining, verify every referenced alias.column exists in that CTE.
+- For customer_map use alias cmap.
+- For customer_master use alias cust.
+- For item_branch_master use alias ibm.
+- For item_master use alias im.
+- For sales_rep_master use alias srm.
+- Never join to a column that is not selected by the upstream CTE.
+- Use ONLY the Required Join Contract paths provided in the prompt. Do not invent joins.
 - Join dimensions explicitly in final_model only when the join key exists in BOTH aliases being joined; use LEFT JOIN.
 - Before writing each JOIN, verify the selected alias actually exposes every column used in the ON condition.
 - Never join columns only because their data types look compatible. Prefer exact shared field names or bridge paths from the generation plan / ownership notes.
 - If a join key is unclear, do not invent a join. Leave a TODO SQL comment and do not reference unavailable fields.
 - If ProductGroupMaster/ProductSubGroupMaster/ProductTypeMaster CTEs exist, join them through ItemBranchMaster -> ItemMaster -> product master keys. Never join FactTable.Item-Branch Key directly to ItemMaster.Short Name.
 - If CustomerMap plus ARSummary/ARSummary_1 CTEs exist, join Fact/CustKey -> CustomerMap/CustKey -> ARSummary/CustKeyAR so AR measures are present.
+- Never join Expenses to FactTable/FactTable_With_Expenses by MonthlyRegionKey only; Account equality is mandatory when joining expenses.
 - End with a complete final SELECT. Never stop after a bare SELECT keyword.
 - If a detail is ambiguous, add a SQL comment and continue. Never stop early.
 """
@@ -3144,6 +3419,9 @@ Core migration rules:
         f"### Qlik Script\n{qvs_script.strip()}",
         f"### Generation Plan\n{plan_text}",
         f"### Ownership / Grain Notes\n{ir_prompt_summary or 'Use the generation plan and Qlik script to infer source ownership.'}",
+        "### Required Join Contract\n"
+        + (join_contract.get('text') or "JOIN CONTRACT:\n- No validated join paths were derived."),
+        "Use ONLY these join paths. Do not invent joins.",
         "Generate the complete dbt SQL now. Start with ### SQL on the first line.",
     ]
     if ir_issues:

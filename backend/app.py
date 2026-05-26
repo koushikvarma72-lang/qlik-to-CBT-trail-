@@ -956,10 +956,13 @@ def _has_blocking_issues(issues):
         'BARE_DDL',
         'SOURCE_TABLE_RENAMED',
         'ALIAS_COLUMN_NOT_FOUND',
+        'DUPLICATE_ALIAS',
         'JOIN_KEY_MISSING',
+        'INVALID_EXPENSES_JOIN_MONTHLY_ONLY',
         'FINAL_MODEL_MISSING',
         'FINAL_SELECT_TOO_SHALLOW',
         'UNION_COLUMN_MISMATCH',
+        'UNION_COLUMN_COUNT_MISMATCH',
         'UNION_SELECT_STAR',
     )
     return any(
