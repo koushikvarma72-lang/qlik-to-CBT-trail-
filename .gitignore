@@ -29,6 +29,7 @@ htmlcov/
 uploads/
 backend/uploads/
 yourfile_extract_tmp/
+generated_artifacts/
 *.qvf
 *.zip
 !samples/*.zip

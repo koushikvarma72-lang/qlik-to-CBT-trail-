@@ -1431,10 +1431,10 @@ def audit_sql_against_ir(sql: str, ir: MigrationIR) -> List[AuditIssue]:
         if col_counts and (max(col_counts) - min(col_counts)) > 0:
             issues.append(AuditIssue(
                 level='warning',
-                code='UNION_COLUMN_COUNT_MISMATCH',
+                code='IR_UNION_BRANCH_COUNT_WARNING',
                 message=(
-                    f"UNION ALL branches have different column counts "
-                    f"(found counts: {col_counts}). This will fail at runtime."
+                    f"IR observed differing union projection counts "
+                    f"({col_counts}). This will fail at runtime."
                 ),
                 suggestion=(
                     "Pad all branches to the same column count using "

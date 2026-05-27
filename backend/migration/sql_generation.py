@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import zipfile
+from datetime import datetime
 from backend.extraction.qvf_runtime import extract_model_from_script
 from backend.extraction.qlik_script_parser import parse_qlik_load_script
 
@@ -149,13 +151,18 @@ def _split_sql_like_fields(field_text):
     depth = 0
     in_single = False
     in_double = False
+    in_bracket = False
 
     for char in field_text:
-        if char == "'" and not in_double:
+        if char == "'" and not in_double and not in_bracket:
             in_single = not in_single
-        elif char == '"' and not in_single:
+        elif char == '"' and not in_single and not in_bracket:
             in_double = not in_double
-        elif not in_single and not in_double:
+        elif char == '[' and not in_single and not in_double:
+            in_bracket = True
+        elif char == ']' and in_bracket and not in_single and not in_double:
+            in_bracket = False
+        elif not in_single and not in_double and not in_bracket:
             if char == '(':
                 depth += 1
             elif char == ')' and depth > 0:
@@ -172,6 +179,11 @@ def _split_sql_like_fields(field_text):
     if tail:
         fields.append(tail)
     return fields
+
+
+def split_top_level_csv(field_text):
+    """Split a SQL select-list by top-level commas while preserving quoted identifiers."""
+    return _split_sql_like_fields(field_text)
 
 
 def _clean_qlik_field_name(field_name):
@@ -271,7 +283,7 @@ def _infer_sql_type_from_name(field_name: str) -> str:
     Used to emit typed NULLs in UNION ALL branches so Snowflake/Databricks don't
     fail on untyped NULL inference across branches with different schemas.
     """
-    name = str(field_name or '').lower().strip().replace(' ', '_').replace('-', '_')
+    name = str(field_name or '').lower().strip().strip('"').strip('`').strip('[]').replace(' ', '_').replace('-', '_')
     if 'account' in name:
         return 'VARCHAR'
     # Date/time fields
@@ -439,10 +451,34 @@ def build_join_contract(plan, qvs_script=''):
         'item_master': 'im',
         'sales_rep_master': 'srm',
     }
+    date_contract_lines = []
+    if ir and getattr(ir, 'date_registry', None):
+        for entry in ir.date_registry.values():
+            field_name = getattr(entry, 'field_name', '')
+            storage_type = getattr(entry, 'storage_type', 'unknown')
+            conversion_sql = getattr(entry, 'conversion_sql', '')
+            if not field_name:
+                continue
+            if storage_type == 'integer_yyyymm':
+                conversion = conversion_sql or "TO_DATE(..., 'YYYYMM')"
+                date_contract_lines.append(
+                    f"- {field_name}: integer/string YYYYMM -> {conversion}"
+                )
+            elif storage_type == 'unknown':
+                date_contract_lines.append(
+                    f"- {field_name}: ambiguous date field -> use TRY_TO_DATE or preserve warning."
+                )
+    if not date_contract_lines:
+        date_contract_lines = [
+            "- YYYYMM: integer/string YYYYMM -> TO_DATE(YYYYMM::varchar, 'YYYYMM')",
+            "- Ambiguous date fields: use TRY_TO_DATE(...) or preserve warning.",
+        ]
+
     forbidden_patterns = [
         'Never join expenses to facttable_with_expenses by MonthlyRegionKey only.',
         'Never reuse the same alias for different CTEs in final_model.',
         'Never reference alias.column that is not selected by that alias CTE.',
+        'Never DATEADD directly on raw integer/date-ambiguous fields.',
     ]
 
     if not ir or not getattr(ir, 'joins', None):
@@ -462,6 +498,7 @@ def build_join_contract(plan, qvs_script=''):
         text += "\n\nALIAS CONTRACT:\n" + "\n".join(
             f"- {table} = {alias}" for table, alias in required_aliases.items()
         )
+        text += "\n\nDATE FIELD CONTRACT:\n" + "\n".join(date_contract_lines[:10])
         text += "\n\nFORBIDDEN PATTERNS:\n" + "\n".join(f"- {rule}" for rule in forbidden_patterns)
         return {
             'join_lines': fallback_lines,
@@ -469,6 +506,7 @@ def build_join_contract(plan, qvs_script=''):
             'warnings': warnings,
             'required_aliases': required_aliases,
             'forbidden_patterns': forbidden_patterns,
+            'date_contract': date_contract_lines,
             'text': text,
         }
 
@@ -530,6 +568,7 @@ def build_join_contract(plan, qvs_script=''):
     text += "\n\nALIAS CONTRACT:\n" + "\n".join(
         f"- {table} = {alias}" for table, alias in required_aliases.items()
     )
+    text += "\n\nDATE FIELD CONTRACT:\n" + "\n".join(date_contract_lines[:10])
     text += "\n\nFORBIDDEN PATTERNS:\n" + "\n".join(f"- {rule}" for rule in forbidden_patterns)
 
     return {
@@ -538,13 +577,273 @@ def build_join_contract(plan, qvs_script=''):
         'warnings': warnings,
         'required_aliases': required_aliases,
         'forbidden_patterns': forbidden_patterns,
+        'date_contract': date_contract_lines,
         'text': text,
     }
 
 
+def _parse_join_contract_line(line: str):
+    match = re.search(
+        r'([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_ \-+]*)\s*->\s*'
+        r'([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_ \-+]*)',
+        str(line or ''),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return {
+        'left_table': match.group(1).strip(),
+        'left_key': match.group(2).strip(),
+        'right_table': match.group(3).strip(),
+        'right_key': match.group(4).strip(),
+    }
+
+
+def _guess_main_fact_cte(sql_text: str):
+    names = [n.lower() for n in _cte_names(sql_text or '')]
+    for preferred in ('facttable_with_expenses', 'fact_table_with_expenses', 'facttable', 'fact_table'):
+        if preferred in names:
+            return preferred
+    return names[0] if names else ''
+
+
+def compose_final_model_from_contract(
+    sql_text: str,
+    join_contract: dict,
+    projection_mode: str = 'safe',
+    return_metadata: bool = False,
+):
+    """Deterministically compose final_model using only allowed contract join paths."""
+    sql = sql_text or ''
+    contract = join_contract or {}
+    join_lines = contract.get('join_lines') or []
+    required_aliases = contract.get('required_aliases') or {}
+    if not sql.strip():
+        return sql
+
+    cte_lookup = {name.lower(): name for name in _cte_names(sql)}
+    base_lineage = _cte_columns_by_name(sql)
+    cte_col_maps = {
+        name.lower(): extract_cte_output_column_map(sql, name, lineage_map=base_lineage)
+        for name in _cte_names(sql)
+    }
+    main_fact = _guess_main_fact_cte(sql)
+    main_fact_ref = cte_lookup.get(main_fact, main_fact)
+    if not main_fact_ref:
+        return sql
+
+    fact_alias = 'ft'
+    projection = (projection_mode or 'safe').strip().lower()
+    if projection not in {'safe', 'rich'}:
+        projection = 'safe'
+    selected_cols = [f'{fact_alias}.*']
+    joins = []
+    joined_tables = {main_fact.lower()}
+    joined_contract_paths = 0
+    total_contract_paths = 0
+    omitted_unsafe_joins = [
+        w for w in (contract.get('warnings') or [])
+        if str(w).startswith('OMITTED_UNSAFE_JOIN:')
+    ]
+
+    for raw_line in join_lines:
+        parsed = _parse_join_contract_line(raw_line)
+        if not parsed:
+            continue
+        total_contract_paths += 1
+        left = parsed['left_table'].lower()
+        right = parsed['right_table'].lower()
+        if right == 'expenses' and main_fact.lower() in {'facttable_with_expenses', 'fact_table_with_expenses'}:
+            continue
+        if left not in cte_lookup or right not in cte_lookup:
+            continue
+        # Build only outward joins reachable from current graph.
+        if left in joined_tables and right not in joined_tables:
+            left_alias = fact_alias if left == main_fact.lower() else required_aliases.get(left, _canonical_table_alias(left))
+            right_alias = required_aliases.get(right, _canonical_table_alias(right))
+            left_ref = resolve_cte_column_reference(left_alias, parsed["left_key"], cte_col_maps.get(left, {}))
+            right_ref = resolve_cte_column_reference(right_alias, parsed["right_key"], cte_col_maps.get(right, {}))
+            joins.append(
+                f'LEFT JOIN {cte_lookup[right]} {right_alias} ON {left_ref} = {right_ref}'
+            )
+            if projection == 'rich':
+                selected_cols.append(f'{right_alias}.*')
+            else:
+                selected_cols.append(right_ref)
+            joined_tables.add(right)
+            joined_contract_paths += 1
+        elif right in joined_tables and left not in joined_tables:
+            left_alias = required_aliases.get(left, _canonical_table_alias(left))
+            right_alias = fact_alias if right == main_fact.lower() else required_aliases.get(right, _canonical_table_alias(right))
+            right_ref = resolve_cte_column_reference(right_alias, parsed["right_key"], cte_col_maps.get(right, {}))
+            left_ref = resolve_cte_column_reference(left_alias, parsed["left_key"], cte_col_maps.get(left, {}))
+            joins.append(
+                f'LEFT JOIN {cte_lookup[left]} {left_alias} ON {right_ref} = {left_ref}'
+            )
+            if projection == 'rich':
+                selected_cols.append(f'{left_alias}.*')
+            else:
+                selected_cols.append(left_ref)
+            joined_tables.add(left)
+            joined_contract_paths += 1
+
+    if not joins:
+        if return_metadata:
+            return sql, {
+                'joinContractCoverage': 0.0,
+                'joinedContractPaths': 0,
+                'totalContractPaths': total_contract_paths,
+                'omittedUnsafeJoins': omitted_unsafe_joins,
+                'projectionMode': projection,
+            }
+        return sql
+
+    select_matches = list(re.finditer(r'\bSELECT\b', sql, flags=re.IGNORECASE))
+    if select_matches:
+        base = sql[:select_matches[-1].start()].rstrip().rstrip(',')
+    else:
+        base = sql.rstrip().rstrip(',')
+    final_model = (
+        f"{base},\n"
+        "final_model AS (\n"
+        f"  SELECT {', '.join(dict.fromkeys(selected_cols))}\n"
+        f"  FROM {main_fact_ref} {fact_alias}\n"
+        f"  " + "\n  ".join(joins) + "\n"
+        ")\n"
+        "SELECT *\n"
+        "FROM final_model"
+    )
+    coverage = 1.0 if total_contract_paths == 0 else max(0.0, min(1.0, joined_contract_paths / float(total_contract_paths)))
+    metadata = {
+        'joinContractCoverage': round(coverage, 4),
+        'joinedContractPaths': joined_contract_paths,
+        'totalContractPaths': total_contract_paths,
+        'omittedUnsafeJoins': omitted_unsafe_joins,
+        'projectionMode': projection,
+    }
+    if return_metadata:
+        return final_model, metadata
+    return final_model
+
+
+def compute_join_contract_coverage(sql_text: str, join_contract: dict):
+    """Compute coverage diagnostics without mutating SQL."""
+    _sql, metrics = compose_final_model_from_contract(
+        sql_text or '',
+        join_contract or {},
+        projection_mode='safe',
+        return_metadata=True,
+    )
+    return metrics
+
+
+_FINAL_MODEL_ENRICHMENT_FIELDS = {
+    'customermap': {'custkeyar', 'customer number', 'customer_number'},
+    'customermaster': {'customer number', 'customer_number', 'customer name', 'customer_name', 'address number', 'address_number', 'sales rep', 'sales_rep'},
+    'customeraddressmaster': {'address number', 'address_number', 'city', 'state', 'zip', 'postal code', 'country'},
+    'arsummary': {'aropen', 'argross', 'ar current', 'ar_current', 'ar1-30', 'ar31-60', 'ar60+', 'custkeyar'},
+    'arsummary_1': {'aropen', 'argross', 'ar current', 'ar_current', 'ar1-30', 'ar31-60', 'ar60+', 'custkeyar'},
+    'budget': {'budget amount', 'budget_amount', 'budget', 'monthlyregionkey'},
+    'historyflag': {'_historyflag', 'historyflag', 'history_flag', 'yyyymm'},
+    'calendar': {'yyyymm', 'fiscal year', 'fiscal_year', 'fiscal quarter', 'fiscal_quarter', 'fiscal month', 'fiscal_month'},
+    'salesrepmaster': {'sales rep', 'sales_rep', 'sales rep name', 'sales_rep_name', 'rep name', 'rep_name'},
+    'itembranchmaster': {'item-branch key', 'item_branch_key', 'short name', 'short_name'},
+    'itemmaster': {'short name', 'short_name', 'product group', 'product_group', 'product sub group', 'product_sub_group', 'product type', 'product_type'},
+    'productgroupmaster': {'product group', 'product_group', 'product group desc', 'product_group_desc', 'description', 'desc'},
+    'productsubgroupmaster': {'product sub group', 'product_sub_group', 'product sub group desc', 'product_sub_group_desc', 'description', 'desc'},
+    'producttypemaster': {'product type', 'product_type', 'product type desc', 'product_type_desc', 'description', 'desc'},
+}
+
+
+def _safe_projection_alias(alias: str, raw_col: str) -> str:
+    name = re.sub(r'[^A-Za-z0-9_]+', '_', f'{alias}_{_normalize_column_token(raw_col)}').strip('_').lower()
+    if not name:
+        name = f'{alias}_field'
+    if re.match(r'^\d', name):
+        name = '_' + name
+    return name
+
+
+def _relation_aliases(alias_map: dict, relation_name: str) -> list[str]:
+    target = _normalize_cte_name(relation_name)
+    return [alias for alias, relation in (alias_map or {}).items() if _normalize_cte_name(relation) == target]
+
+
+def _projection_raw_expr_key(expr: str) -> str:
+    expr = re.sub(r'\s+\bAS\b\s+.*$', '', str(expr or '').strip(), flags=re.IGNORECASE)
+    return re.sub(r'\s+', '', expr).replace('"', '').lower()
+
+
+def enrich_final_model_projection(sql_text: str) -> str:
+    """Add safe enrichment fields from already-joined dimension aliases."""
+    sql = sql_text or ''
+    target_cte = 'final_model' if _cte_body_for(sql, 'final_model') else ('final_mart' if _cte_body_for(sql, 'final_mart') else '')
+    if not target_cte:
+        return sql
+    body = _cte_body_for(sql, target_cte)
+    if not body:
+        return sql
+    select_list, from_tail = _extract_top_level_select_and_from(body)
+    if not select_list or not from_tail:
+        return sql
+
+    fields = split_top_level_csv(re.sub(r'^\s*DISTINCT\b\s*', '', select_list, flags=re.IGNORECASE))
+    alias_map = extract_alias_to_cte_map(body)
+    base_lineage = _cte_columns_by_name(sql)
+    cte_cols = {
+        _normalize_cte_name(name): extract_cte_output_column_map(sql, name, lineage_map=base_lineage)
+        for name in _cte_names(sql)
+    }
+    fact_aliases = {
+        alias for alias, relation in alias_map.items()
+        if relation in {'facttable_with_expenses', 'fact_table_with_expenses', 'facttable', 'fact_table'}
+    }
+    fact_cols = set()
+    for alias in fact_aliases:
+        relation = alias_map.get(alias)
+        fact_cols.update(cte_cols.get(_normalize_cte_name(relation), {}).keys())
+
+    existing_outputs = {_normalize_column_token(extract_output_alias(field)) for field in fields if extract_output_alias(field)}
+    existing_exprs = {re.sub(r'\s+', ' ', field.strip()).lower() for field in fields}
+    existing_raw_refs = {_projection_raw_expr_key(field) for field in fields}
+    additions = []
+
+    for relation_name, desired_cols in _FINAL_MODEL_ENRICHMENT_FIELDS.items():
+        desired_norm = {_normalize_column_token(col) for col in desired_cols}
+        for alias in _relation_aliases(alias_map, relation_name):
+            col_map = cte_cols.get(_normalize_cte_name(relation_name), {})
+            for norm_col, raw_col in col_map.items():
+                if norm_col not in desired_norm:
+                    continue
+                if norm_col in fact_cols:
+                    continue
+                if norm_col in existing_outputs:
+                    continue
+                projection_alias = _safe_projection_alias(alias, raw_col)
+                if projection_alias in existing_outputs:
+                    continue
+                raw_ref = resolve_cte_column_reference(alias, raw_col, col_map)
+                raw_ref_key = _projection_raw_expr_key(raw_ref)
+                if raw_ref_key in existing_raw_refs:
+                    continue
+                expr = f'{raw_ref} AS {projection_alias}'
+                expr_key = re.sub(r'\s+', ' ', expr.strip()).lower()
+                if expr_key in existing_exprs:
+                    continue
+                additions.append(expr)
+                existing_outputs.add(projection_alias)
+                existing_exprs.add(expr_key)
+                existing_raw_refs.add(raw_ref_key)
+
+    if not additions:
+        return sql
+    rebuilt_body = 'SELECT\n    ' + ',\n    '.join(fields + additions) + '\n' + from_tail.strip()
+    return _replace_cte_body(sql, target_cte, '\n' + rebuilt_body + '\n')
+
+
 def _audit_generated_sql_against_plan(sql_text, plan=None, qvs_script='', dialect='dbt'):
     """Validate source ownership, join keys, grain risks, and UNION shape."""
-    issues = validate_generated_sql(sql_text, plan, dialect)
+    issues = validate_generated_sql(sql_text, plan, dialect, qvs_script=qvs_script)
     ir, ir_issues, _, _ = _build_ir_context(plan or [], qvs_script or '')
     issues.extend(_format_ir_issues_for_sql(ir_issues))
     if ir and audit_sql_against_ir:
@@ -1362,6 +1661,11 @@ def _cte_body_for(sql_text: str, cte_name: str) -> str:
     return sql_text[bounds[1]:bounds[2]] if bounds else ''
 
 
+def extract_cte_body(sql_text: str, cte_name: str) -> str:
+    """Public helper for CTE body extraction."""
+    return _cte_body_for(sql_text, cte_name)
+
+
 def _replace_cte_body(sql_text: str, cte_name: str, new_body: str) -> str:
     bounds = _cte_bounds(sql_text, cte_name)
     if not bounds:
@@ -1371,8 +1675,8 @@ def _replace_cte_body(sql_text: str, cte_name: str, new_body: str) -> str:
 
 
 def _select_body(body: str) -> str:
-    match = re.search(r'\bSELECT\b(.*?)\bFROM\b', body or '', flags=re.IGNORECASE | re.DOTALL)
-    return match.group(1) if match else ''
+    select_list, _ = _extract_top_level_select_and_from(body or '')
+    return select_list
 
 
 def _select_source(body: str) -> str:
@@ -1380,19 +1684,187 @@ def _select_source(body: str) -> str:
     return match.group(1) if match else ''
 
 
+def _extract_top_level_select_and_from(sql_text: str):
+    """Return (select_list, from_tail) for top-level SELECT ... FROM in a SQL fragment."""
+    sql = sql_text or ''
+    if not sql:
+        return '', ''
+    depth = 0
+    in_single = False
+    in_double = False
+    select_start = -1
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == '(':
+                depth += 1
+            elif ch == ')' and depth > 0:
+                depth -= 1
+            elif depth == 0 and select_start < 0 and sql[i:i + 6].lower() == 'select':
+                prev = sql[i - 1] if i > 0 else ' '
+                nxt = sql[i + 6] if i + 6 < len(sql) else ' '
+                if not prev.isalnum() and prev != '_' and not nxt.isalnum() and nxt != '_':
+                    select_start = i + 6
+                    i += 6
+                    continue
+            elif depth == 0 and select_start >= 0 and sql[i:i + 4].lower() == 'from':
+                prev = sql[i - 1] if i > 0 else ' '
+                nxt = sql[i + 4] if i + 4 < len(sql) else ' '
+                if not prev.isalnum() and prev != '_' and not nxt.isalnum() and nxt != '_':
+                    return sql[select_start:i], sql[i:]
+        i += 1
+    return '', ''
+
+
+def split_top_level_union_all(cte_body: str) -> list[str]:
+    sql = cte_body or ''
+    parts = []
+    depth = 0
+    in_single = False
+    in_double = False
+    start = 0
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == '(':
+                depth += 1
+            elif ch == ')' and depth > 0:
+                depth -= 1
+            elif depth == 0 and sql[i:i + 9].lower() == 'union all':
+                parts.append(sql[start:i].strip())
+                i += 9
+                start = i
+                continue
+        i += 1
+    tail = sql[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
 def _select_output_columns(body: str):
     columns = []
-    for item in _split_sql_like_fields(_select_body(body)):
-        expr, alias = _split_alias_from_expression(item)
-        raw_output = alias or expr
-        output = str(raw_output or '').strip().strip('[]').strip('"')
+    select_body = _select_body(body)
+    # DISTINCT should not become part of the first output column token.
+    select_body = re.sub(r'^\s*DISTINCT\b\s*', '', select_body, flags=re.IGNORECASE)
+    for item in _split_sql_like_fields(select_body):
+        output = extract_output_alias(item)
         if output and output != '*':
             columns.append(output)
     return columns
 
 
+def _unquote_identifier_token(raw_output: str) -> str:
+    """Return an identifier token with only its outer quoting removed."""
+    output = str(raw_output or '').strip()
+    if not output:
+        return ''
+    if len(output) >= 2 and output[0] == '"' and output[-1] == '"':
+        return output[1:-1].strip()
+    if len(output) >= 2 and output[0] == '[' and output[-1] == ']':
+        return output[1:-1].strip()
+    if len(output) >= 2 and output[0] == '`' and output[-1] == '`':
+        return output[1:-1].strip()
+    return output.strip()
+
+
+def _output_column_token(raw_output: str) -> str:
+    """Compatibility wrapper for output-name extraction."""
+    return _unquote_identifier_token(raw_output)
+
+
+def extract_output_alias(expr: str) -> str:
+    """Extract a SELECT item's output column name without blanking quoted identifiers."""
+    expression, alias = _split_alias_from_expression(expr)
+    if alias:
+        return _unquote_identifier_token(alias)
+    token = str(expression or '').strip()
+    if not token:
+        return ''
+    simple = re.match(
+        r'^(?:[A-Za-z_][A-Za-z0-9_]*\.)?("([^"]+)"|`([^`]+)`|\[([^\]]+)\]|[A-Za-z_][A-Za-z0-9_]*)$',
+        token,
+    )
+    if not simple:
+        return ''
+    raw = simple.group(1)
+    if '.' in raw and not raw.startswith(('"', '`', '[')):
+        raw = raw.rsplit('.', 1)[-1]
+    return _unquote_identifier_token(raw)
+
+
+def extract_projection_display_names(select_sql: str) -> list[str]:
+    """Return readable output column names from a SELECT statement or branch."""
+    select_body = _select_body(select_sql or '')
+    select_body = re.sub(r'^\s*DISTINCT\b\s*', '', select_body, flags=re.IGNORECASE)
+    fields = split_top_level_csv(select_body)
+    outputs = []
+    for item in fields:
+        out = extract_output_alias(item)
+        if out and out != '*' and out != '""':
+            outputs.append(out)
+    return outputs
+
+
+def extract_select_projection_columns(select_sql: str) -> list[str]:
+    """
+    Return normalized output column names from a SELECT statement/branch.
+
+    The parser is top-level comma aware and preserves quoted identifiers until
+    after the output alias/name is extracted.
+    """
+    return [
+        _normalize_column_token(column)
+        for column in extract_projection_display_names(select_sql or '')
+        if _normalize_column_token(column)
+    ]
+
+
+def _projection_parser_integrity_issues(select_sql: str) -> list[str]:
+    select_body = _select_body(select_sql or '')
+    select_body = re.sub(r'^\s*DISTINCT\b\s*', '', select_body, flags=re.IGNORECASE)
+    issues = []
+    for item in split_top_level_csv(select_body):
+        stripped = str(item or '').strip()
+        if not stripped:
+            issues.append('INTERNAL_PARSER_ERROR: empty projection token encountered.')
+            continue
+        if re.search(r'(?<![A-Za-z0-9_])""(?![A-Za-z0-9_])', stripped):
+            issues.append('INTERNAL_PARSER_ERROR: empty quoted identifier encountered in projection parser.')
+            continue
+        if re.match(r'(?is)^(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*$', stripped):
+            continue
+        try:
+            output = extract_output_alias(stripped)
+        except Exception as exc:
+            issues.append(f'INTERNAL_PARSER_ERROR: projection parser crashed: {exc}')
+            continue
+        if output == '""' or output == '':
+            issues.append(f'INTERNAL_PARSER_ERROR: projection parser returned empty output for {stripped[:80]}.')
+    return issues
+
+
+def count_select_columns_for_branch(branch_sql: str, lineage_map=None) -> int:
+    if re.search(r'\bSELECT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*', branch_sql or '', re.IGNORECASE):
+        return None
+    return len(extract_select_projection_columns(branch_sql or ''))
+
+
 def _sql_column_ref(column: str) -> str:
-    return column if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', column or '') else f'"{column}"'
+    value = str(column or '').strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value
+    return value if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', value) else f'"{value}"'
 
 
 def _render_union_branch(source_name: str, columns, available_columns, null_columns=None) -> str:
@@ -1419,6 +1891,115 @@ def _append_unique_columns(columns, extra_columns):
     return merged
 
 
+def _extract_simple_output_name(expr: str):
+    return extract_output_alias(expr)
+
+
+def _alias_map_for_select_scope(select_sql: str):
+    alias_map = {}
+    for match in re.finditer(
+        r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?',
+        select_sql or '',
+        flags=re.IGNORECASE,
+    ):
+        relation = match.group(1)
+        alias = match.group(2) or relation
+        alias_map[alias.lower()] = relation
+    return alias_map
+
+
+def extract_union_branch_columns(select_sql: str, lineage_map=None, alias_map=None) -> list[str]:
+    """Extract output columns for a SELECT branch, expanding * / alias.* using lineage."""
+    lineage_map = lineage_map or {}
+    alias_map = alias_map or _alias_map_for_select_scope(select_sql or '')
+    select_body = _select_body(select_sql or '')
+    select_body = re.sub(r'^\s*DISTINCT\b\s*', '', select_body, flags=re.IGNORECASE)
+    fields = _split_sql_like_fields(select_body)
+    outputs = []
+    for item in fields:
+        expr, alias = _split_alias_from_expression(item)
+        expr = str(expr or '').strip()
+        alias = str(alias or '').strip()
+        if alias:
+            out = extract_output_alias(item)
+            if out:
+                outputs.append(out)
+            continue
+        star_alias = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\.\*$', expr)
+        if star_alias:
+            relation = alias_map.get(star_alias.group(1).lower())
+            cols = lineage_map.get((relation or '').lower(), [])
+            if not cols:
+                raise ValueError(f'Unable to expand {expr}: source columns unavailable.')
+            outputs.extend(cols)
+            continue
+        if expr == '*':
+            source = _select_source(select_sql or '')
+            relation = alias_map.get(source.lower(), source)
+            cols = lineage_map.get((relation or '').lower(), [])
+            if not cols:
+                raise ValueError('Unable to expand *: source columns unavailable.')
+            outputs.extend(cols)
+            continue
+        out = extract_output_alias(expr)
+        if out:
+            outputs.append(out)
+            continue
+        raise ValueError(f'Non-deterministic SELECT expression without alias: {expr}')
+    return outputs
+
+
+def extract_cte_output_columns(sql: str, cte_name: str, lineage_map=None) -> list[str]:
+    """Extract CTE output columns with star expansion using upstream lineage."""
+    lineage_map = dict(lineage_map or {})
+    body = extract_cte_body(sql, cte_name)
+    if not body:
+        return []
+    union_branches = split_top_level_union_all(body)
+    if len(union_branches) > 1:
+        merged = []
+        seen = set()
+        for branch in union_branches:
+            try:
+                cols = extract_union_branch_columns(branch, lineage_map=lineage_map)
+            except Exception:
+                cols = _select_output_columns(branch)
+            for col in cols or []:
+                norm = _normalize_column_token(col)
+                if norm and norm not in seen:
+                    seen.add(norm)
+                    merged.append(col)
+        if merged:
+            return merged
+    # Seed map with direct columns first for relation lookups.
+    direct = _select_output_columns(body)
+    if direct:
+        lineage_map.setdefault(cte_name.lower(), direct)
+    try:
+        return extract_union_branch_columns(body, lineage_map=lineage_map)
+    except Exception:
+        return direct
+
+
+def extract_cte_output_column_map(sql: str, cte_name: str, lineage_map=None) -> dict:
+    """Return normalized->raw output column map for a CTE, including alias-star expansion."""
+    body = extract_cte_body(sql, cte_name)
+    resolved = cte_name
+    if not body:
+        target = _normalize_cte_name(cte_name)
+        for candidate in _cte_names(sql):
+            if _normalize_cte_name(candidate) == target:
+                resolved = candidate
+                break
+    cols = extract_cte_output_columns(sql, resolved, lineage_map=lineage_map)
+    result = {}
+    for col in cols or []:
+        norm = _normalize_column_token(col)
+        if norm and norm not in result:
+            result[norm] = col
+    return result
+
+
 def _expand_union_select_star_cte(sql_text: str, cte_name: str) -> str:
     """Expand SELECT * UNION branches to explicit, aligned column lists."""
     body = _cte_body_for(sql_text, cte_name)
@@ -1435,7 +2016,7 @@ def _expand_union_select_star_cte(sql_text: str, cte_name: str) -> str:
     seen = set()
     for branch in branches:
         source = _select_source(branch)
-        has_select_star = bool(re.search(r'\bSELECT\s+\*\s+FROM\b', branch, re.IGNORECASE))
+        has_select_star = bool(re.search(r'\bSELECT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*\s+FROM\b', branch, re.IGNORECASE))
         saw_select_star = saw_select_star or has_select_star
         branch_columns = _select_output_columns(branch)
         source_columns = _select_output_columns(_cte_body_for(sql_text, source)) if source else []
@@ -1530,27 +2111,14 @@ def enforce_final_model_wrapper(sql_text: str) -> str:
     )
 
 
-def enforce_facttable_expenses_schema(sql_text: str) -> str:
+def enforce_facttable_expenses_schema(sql_text: str, plan=None) -> str:
     """Repair the recurring fact/expenses UNION shape without relying on the LLM."""
     sql = sql_text or ''
-    fact_body = _cte_body_for(sql, 'facttable')
-    union_body = _cte_body_for(sql, 'facttable_with_expenses')
+    fact_body = _cte_body_for(sql, 'facttable') or _cte_body_for(sql, 'fact_table')
+    union_cte = 'facttable_with_expenses' if _cte_body_for(sql, 'facttable_with_expenses') else 'fact_table_with_expenses'
+    union_body = _cte_body_for(sql, union_cte)
     if not fact_body or not union_body or not re.search(r'\bUNION\s+ALL\b', union_body, re.IGNORECASE):
         return sql
-
-    fact_columns = _select_output_columns(fact_body)
-    if 'account' not in {c.lower() for c in fact_columns}:
-        select_body = _select_body(fact_body)
-        fields = _split_sql_like_fields(select_body)
-        insert_at = next((idx + 1 for idx, item in enumerate(fields)
-                          if _extract_output_name(*_split_alias_from_expression(item)).lower() == 'region'), 1)
-        fields.insert(insert_at, 'CAST(NULL AS VARCHAR) AS Account')
-        match = re.search(r'\bSELECT\b(.*?)\bFROM\b', fact_body, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            new_select = '\n    ' + ',\n    '.join(fields) + '\n'
-            fact_body = fact_body[:match.start(1)] + new_select + fact_body[match.end(1):]
-            sql = _replace_cte_body(sql, 'facttable', fact_body)
-            fact_columns = _select_output_columns(fact_body)
 
     branches = re.split(r'\bUNION\s+ALL\b', union_body, flags=re.IGNORECASE)
     if len(branches) != 2:
@@ -1558,30 +2126,15 @@ def enforce_facttable_expenses_schema(sql_text: str) -> str:
 
     first_source = _select_source(branches[0]) or 'facttable'
     second_source = _select_source(branches[1]) or 'expenses_for_fact'
-    first_columns = fact_columns
-    second_columns = _select_output_columns(branches[1]) or _select_output_columns(_cte_body_for(sql, second_source))
-    second_source_columns = _select_output_columns(_cte_body_for(sql, second_source))
-    if second_source and 'expenses' in second_source.lower():
-        second_columns = _append_unique_columns(second_columns, second_source_columns)
-    expenses_columns = _select_output_columns(_cte_body_for(sql, 'expenses'))
-    if expenses_columns:
-        second_columns = _append_unique_columns(second_columns, expenses_columns)
+    if _normalize_cte_name(first_source) not in {'facttable', 'fact_table'}:
+        first_source = 'facttable' if _cte_body_for(sql, 'facttable') else 'fact_table'
+    if _cte_body_for(sql, 'expenses'):
+        second_source = 'expenses'
 
-    schema = list(first_columns)
-    for column in second_columns:
-        if column.lower() not in {c.lower() for c in schema}:
-            schema.append(column)
-    if 'account' not in {c.lower() for c in schema}:
-        schema.insert(2 if len(schema) >= 2 else len(schema), 'Account')
-
-    new_union_body = (
-        '\n'
-        + _render_union_branch(first_source, schema, first_columns, null_columns={'Account'})
-        + '\n\nUNION ALL\n\n'
-        + _render_union_branch(second_source, schema, second_columns)
-        + '\n'
-    )
-    return _replace_cte_body(sql, 'facttable_with_expenses', new_union_body)
+    new_union_body = _build_dynamic_fact_expenses_union_body(sql, first_source, second_source, plan=plan)
+    if not new_union_body:
+        return sql
+    return _replace_cte_body(sql, union_cte, new_union_body)
 
 
 def enforce_facttable_region_schema(sql_text: str) -> str:
@@ -1611,6 +2164,43 @@ def enforce_facttable_region_schema(sql_text: str) -> str:
     new_select = '\n    ' + ',\n    '.join(fields) + '\n'
     fact_body = fact_body[:match.start(1)] + new_select + fact_body[match.end(1):]
     return _replace_cte_body(sql, 'facttable', fact_body)
+
+
+def enforce_expenses_yyyymm_coercion(sql_text: str) -> str:
+    """Ensure expenses-like CTEs expose shifted YYYYMM for downstream UNION branches."""
+    sql = sql_text or ''
+    for cte_name in _cte_names(sql):
+        lname = cte_name.lower()
+        if 'expenses' not in lname:
+            continue
+        body = _cte_body_for(sql, cte_name)
+        if not body:
+            continue
+        cols = _select_output_columns(body)
+        lower_cols = {c.lower() for c in cols}
+        if not ({'monthlyregionkey', 'account'} & lower_cols):
+            continue
+        select_body = _select_body(body)
+        fields = _split_sql_like_fields(select_body)
+        if not fields:
+            continue
+        replaced = False
+        for idx, field in enumerate(fields):
+            expr, alias = _split_alias_from_expression(field)
+            out = (alias or expr or '').strip().strip('"').strip('[]').lower()
+            if out == 'yyyymm':
+                fields[idx] = "DATEADD(month, 12, TO_DATE(YYYYMM::varchar, 'YYYYMM')) AS YYYYMM"
+                replaced = True
+                break
+        if not replaced:
+            fields.append("DATEADD(month, 12, TO_DATE(YYYYMM::varchar, 'YYYYMM')) AS YYYYMM")
+        match = re.search(r'\bSELECT\b(.*?)\bFROM\b', body, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        new_select = '\n    ' + ',\n    '.join(fields) + '\n'
+        body = body[:match.start(1)] + new_select + body[match.end(1):]
+        sql = _replace_cte_body(sql, cte_name, body)
+    return sql
 
 
 def enforce_expenses_account_join(sql_text: str) -> str:
@@ -1657,15 +2247,700 @@ def enforce_expenses_account_join(sql_text: str) -> str:
     return join_pattern.sub(replace_join, sql)
 
 
-def finalize_generated_sql(sql_text: str) -> str:
-    """Apply deterministic post-repair invariants before validation/return."""
-    sql = normalize_dbt_config_braces(sql_text or '')
-    sql = enforce_facttable_region_schema(sql)
-    sql = enforce_facttable_expenses_schema(sql)
+def has_union_star_branch(sql: str) -> bool:
+    if not sql:
+        return False
+    return bool(re.search(
+        r'(?is)\bSELECT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*\s*(?:,|\bFROM\b)[\s\S]*?\bUNION\s+ALL\b',
+        sql
+    ))
+
+
+def has_fact_expenses_join_cte(sql: str) -> bool:
+    return bool(_cte_body_for(sql or '', 'facttable_with_expenses') or _cte_body_for(sql or '', 'fact_table_with_expenses'))
+
+
+def _fact_expenses_cte_name(sql: str) -> str:
+    if _cte_body_for(sql or '', 'facttable_with_expenses'):
+        return 'facttable_with_expenses'
+    if _cte_body_for(sql or '', 'fact_table_with_expenses'):
+        return 'fact_table_with_expenses'
+    return ''
+
+
+def _needs_fact_expenses_dynamic_rebuild(sql: str) -> bool:
+    cte_name = _fact_expenses_cte_name(sql or '')
+    if not cte_name:
+        return False
+    body = _cte_body_for(sql or '', cte_name)
+    if not body:
+        return False
+    if re.search(r'\bJOIN\s+(?:expenses|expenses_for_fact|int_expenses|expenses_aggregated|int_expenses_aggregated)\b', body, re.IGNORECASE):
+        return True
+    if has_union_star_branch(body):
+        return True
+    if re.search(r'\bUNION\s+ALL\b', body, re.IGNORECASE):
+        return True
+    return False
+
+
+def fact_expenses_cte_has_alias_star(sql: str) -> bool:
+    body = extract_cte_body(sql, 'facttable_with_expenses') or extract_cte_body(sql, 'fact_table_with_expenses')
+    if not body:
+        return False
+    return bool(re.search(r'(?is)\bSELECT\s+[A-Za-z_][A-Za-z0-9_]*\.\*', body))
+
+
+def expand_fact_expenses_alias_star(sql: str) -> str:
+    """
+    Expand first UNION branch alias-star in facttable_with_expenses to explicit fact columns.
+    Returns original SQL if deterministic expansion cannot be proven.
+    """
+    cte_name = _fact_expenses_cte_name(sql)
+    if not cte_name:
+        return sql
+    body = _cte_body_for(sql, cte_name)
+    if not body or not re.search(r'\bUNION\s+ALL\b', body, re.IGNORECASE):
+        return sql
+    if not re.search(r'(?is)\bSELECT\s+[A-Za-z_][A-Za-z0-9_]*\.\*', body):
+        return sql
+
+    branches = split_top_level_union_all(body)
+    if len(branches) < 2:
+        return sql
+
+    first_branch = branches[0]
+    select_match = re.search(
+        r'(?is)^\s*SELECT\s+(?P<select_body>.*?)\bFROM\b\s+(?P<source>[A-Za-z_][A-Za-z0-9_]*)\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\b(?P<tail>[\s\S]*)$',
+        first_branch.strip(),
+    )
+    if not select_match:
+        return sql
+
+    source_cte = select_match.group('source')
+    alias = select_match.group('alias')
+    select_body = select_match.group('select_body')
+    source_cols = extract_cte_output_columns(sql, source_cte, lineage_map=_cte_columns_by_name(sql))
+    if not source_cols:
+        return sql
+
+    fields = _split_sql_like_fields(select_body)
+    expanded_fields = []
+    replaced_star = False
+    star_pattern = re.compile(rf'^\s*{re.escape(alias)}\.\*\s*$', re.IGNORECASE)
+    for field in fields:
+        if star_pattern.match(field):
+            replaced_star = True
+            expanded_fields.extend(_sql_column_ref(col) for col in source_cols)
+        else:
+            expanded_fields.append(field.strip())
+    if not replaced_star:
+        return sql
+
+    rebuilt_first = (
+        'SELECT\n    '
+        + ',\n    '.join(expanded_fields)
+        + f"\nFROM {source_cte}{select_match.group('tail')}"
+    )
+    branches[0] = rebuilt_first
+    new_body = '\n' + '\n\nUNION ALL\n\n'.join(branches) + '\n'
+    return _replace_cte_body(sql, cte_name, new_body)
+
+
+def _mark_dynamic_union_rebuild_failed(sql: str) -> str:
+    marker = '-- DYNAMIC_UNION_REBUILD_FAILED'
+    if marker in (sql or ''):
+        return sql
+    return (sql or '').rstrip() + '\n' + marker + '\n'
+
+
+def plan_has_expenses_concatenate(plan) -> bool:
+    """
+    Return true when parsed plan indicates expenses is concatenated into a fact table.
+    """
+    for item in plan or []:
+        text = ' '.join(str(item.get(k, '')) for k in ['table', 'source', 'concatenate_target', 'operation']).lower()
+        if item.get('is_concatenate') and 'expense' in text:
+            return True
+        if 'expense' in text and 'concat' in text:
+            return True
+    return False
+
+
+def final_model_has_bad_expenses_join(sql: str) -> bool:
+    """
+    Return true when final_model/final_mart joins expenses directly to a fact/base CTE.
+    """
+    body = extract_cte_body(sql, 'final_model') or extract_cte_body(sql, 'final_mart')
+    if not body:
+        return False
+    return bool(re.search(
+        r'(?is)\bFROM\s+(facttable_with_expenses|fact_table_with_expenses|facttable|fact_table|[A-Za-z_][A-Za-z0-9_]*fact[A-Za-z0-9_]*)\s+\w+[\s\S]*?\bJOIN\s+expenses\s+\w+\s+ON\b',
+        body
+    ))
+
+
+def remove_join_clause(body: str, join_alias: str) -> str:
+    """Remove a direct expenses join and its full ON predicate from a SELECT body."""
+    alias = re.escape(str(join_alias or '').strip())
+    if not alias:
+        return body
+    pattern = re.compile(
+        rf'(?is)\s+(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN\s+expenses\s+(?:AS\s+)?{alias}\s+ON\s+'
+        rf'.*?(?=\s+(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN\b|\s+WHERE\b|\s+GROUP\s+BY\b|'
+        rf'\s+ORDER\s+BY\b|\s+HAVING\b|\s+QUALIFY\b|\s*\)|$)'
+    )
+    cleaned = pattern.sub('\n', body or '')
+    cleaned = re.sub(r'(?i)([A-Za-z_][A-Za-z0-9_]*\.Account)(LEFT\s+JOIN)', r'\1 \2', cleaned)
+    cleaned = re.sub(
+        rf'(?im)^\s*AND\s+[A-Za-z_][A-Za-z0-9_]*\."?[A-Za-z_][A-Za-z0-9_ ]*"?\s*=\s*{alias}\."?[A-Za-z_][A-Za-z0-9_ ]*"?\s*$\n?',
+        '',
+        cleaned,
+    )
+    return cleaned
+
+
+def _remove_select_items_for_alias(body: str, alias: str) -> str:
+    select_body = _select_body(body)
+    fields = _split_sql_like_fields(select_body)
+    if not fields:
+        return body
+    kept = [
+        item for item in fields
+        if not re.search(rf'^\s*{re.escape(alias)}\.(?:\*|"?[A-Za-z_][A-Za-z0-9_ ]*"?)\b', item, flags=re.IGNORECASE)
+    ]
+    if len(kept) == len(fields):
+        return body
+    return re.sub(
+        r'(\bSELECT\b)(.*?)(\bFROM\b)',
+        lambda m: f"{m.group(1)}\n    " + ',\n    '.join(kept) + f"\n{m.group(3)}",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+        count=1,
+    )
+
+
+def _cleanup_leftover_expenses_alias_refs(sql: str, body: str, alias: str = 'e') -> str:
+    """
+    After expenses are merged into facttable_with_expenses, retarget safe account
+    predicates from the old expenses alias to the fact/union alias and remove any
+    remaining orphaned expenses alias references.
+    """
+    body = body or ''
+    alias = str(alias or 'e').strip()
+    if not alias:
+        return body
+
+    from_match = re.search(
+        r'\bFROM\s+(facttable_with_expenses|fact_table_with_expenses)\s+(?:AS\s+)?(?P<fact_alias>[A-Za-z_][A-Za-z0-9_]*)\b',
+        body,
+        flags=re.IGNORECASE,
+    )
+    if not from_match:
+        return body
+
+    union_cte = from_match.group(1)
+    fact_alias = from_match.group('fact_alias')
+    union_cols = extract_cte_output_column_map(sql or '', union_cte)
+    if 'account' in union_cols:
+        fact_account_ref = f'{fact_alias}.{union_cols.get("account") or "account"}'
+        alias_re = re.escape(alias)
+        body = re.sub(
+            rf'(?is)(?<![A-Za-z0-9_]){alias_re}\s*\.\s*"?account"?\s*=\s*'
+            rf'(?P<right>[A-Za-z_][A-Za-z0-9_]*\s*\.\s*"?account"?)',
+            lambda m: f'{fact_account_ref} = {m.group("right")}',
+            body,
+        )
+        body = re.sub(
+            rf'(?is)(?P<left>[A-Za-z_][A-Za-z0-9_]*\s*\.\s*"?account"?)\s*=\s*'
+            rf'(?<![A-Za-z0-9_]){alias_re}\s*\.\s*"?account"?',
+            lambda m: f'{m.group("left")} = {fact_account_ref}',
+            body,
+        )
+
+    body = _remove_select_items_for_alias(body, alias)
+    if not re.search(rf'(?is)\bJOIN\s+expenses\s+(?:AS\s+)?{re.escape(alias)}\b', body):
+        body = re.sub(
+            rf'(?im)^\s*(?:AND|OR)\s+.*(?<![A-Za-z0-9_]){re.escape(alias)}\s*\.\s*'
+            rf'(?:\*|"?[A-Za-z_][A-Za-z0-9_ ]*"?)\b.*$\n?',
+            '',
+            body,
+        )
+    return body
+
+
+def _explicit_concatenate_fields_for_target(plan, target_table: str, source_table: str = ''):
+    target_norm = _normalize_cte_name(target_table)
+    source_norm = _normalize_cte_name(source_table)
+    for item in plan or []:
+        if not item.get('is_concatenate'):
+            continue
+        if _normalize_cte_name(item.get('concatenate_target') or '') != target_norm:
+            continue
+        item_names = {
+            _normalize_cte_name(item.get('table') or ''),
+            _normalize_cte_name(item.get('source') or ''),
+            *{_normalize_cte_name(src) for src in (item.get('source_tables') or [])},
+        }
+        source_matches = (
+            not source_norm
+            or source_norm in item_names
+            or any(source_norm in name or name in source_norm for name in item_names if name)
+        )
+        # Executive Dashboard emits Expenses under a few deterministic CTE names;
+        # once Qlik explicitly targets FactTable, the listed LOAD fields are the
+        # authoritative source branch shape even if the generated CTE was renamed.
+        if not source_matches and target_norm == 'facttable' and 'expense' in source_norm:
+            source_matches = True
+        if not source_matches:
+            continue
+        fields = [_normalize_column_token(_extract_output_column_name(field)) for field in (item.get('fields') or [])]
+        return {field for field in fields if field}
+    return None
+
+
+def _has_explicit_facttable_concatenate(plan, qvs_script: str = '') -> bool:
+    if any(
+        item.get('is_concatenate')
+        and _normalize_cte_name(item.get('concatenate_target') or '') == 'facttable'
+        for item in (plan or [])
+    ):
+        return True
+    return bool(re.search(
+        r'(?is)\bCONCATENATE\s*\(\s*FactTable\s*\)\s*LOAD\b.*?\bRESIDENT\s+Expenses\b',
+        qvs_script or '',
+    ))
+
+
+def _explicit_facttable_concat_fields_from_qvs(qvs_script: str) -> set:
+    match = re.search(
+        r'(?is)\bCONCATENATE\s*\(\s*FactTable\s*\)\s*LOAD\s+(?P<fields>.*?)\bRESIDENT\s+Expenses\b',
+        qvs_script or '',
+    )
+    if not match:
+        return set()
+    fields = []
+    for item in split_top_level_csv(match.group('fields')):
+        cleaned = re.sub(r'(?is)\s+AS\s+.*$', '', item).strip()
+        cleaned = re.sub(r'(?is)\bDISTINCT\b', '', cleaned).strip()
+        if cleaned:
+            fields.append(_normalize_column_token(_extract_output_column_name(cleaned)))
+    return {field for field in fields if field}
+
+
+def _target_table_for_fact_cte(fact_cte: str) -> str:
+    norm = _normalize_cte_name(fact_cte)
+    if norm in {'facttable', 'fact_table'}:
+        return 'FactTable'
+    return fact_cte
+
+
+def _cte_for_plan_table(sql: str, table_name: str) -> str:
+    target = _normalize_cte_name(table_name)
+    aliases = {
+        'facttable': ['facttable', 'fact_table'],
+        'expenses': ['expenses', 'expenses_for_fact', 'int_expenses', 'expenses_aggregated', 'int_expenses_aggregated'],
+    }
+    for candidate in aliases.get(target, [target]):
+        if _cte_body_for(sql or '', candidate):
+            return candidate
+    for name in _cte_names(sql or ''):
+        if _normalize_cte_name(name) == target:
+            return name
+    return ''
+
+
+def _explicit_concat_target_source_ctes(sql: str, plan=None):
+    for item in plan or []:
+        if not item.get('is_concatenate'):
+            continue
+        target = item.get('concatenate_target') or ''
+        target_cte = _cte_for_plan_table(sql, target)
+        source_cte = _cte_for_plan_table(sql, item.get('table') or '')
+        if not source_cte:
+            for src in item.get('source_tables') or []:
+                source_cte = _cte_for_plan_table(sql, src)
+                if source_cte:
+                    break
+        if target_cte and source_cte:
+            return target_cte, source_cte
+    return '', ''
+
+
+def enforce_explicit_facttable_concatenate_schema(sql_text: str, plan=None, qvs_script: str = '') -> str:
+    """Force explicit CONCATENATE (FactTable) unions to the target FactTable schema only."""
+    return enforce_explicit_concat_target_schema(sql_text, plan, qvs_script=qvs_script)
+
+
+def enforce_explicit_concat_target_schema(sql_text: str, plan=None, qvs_script: str = '') -> str:
+    """Rebuild explicit Qlik CONCATENATE target unions using only the target table schema."""
+    sql = sql_text or ''
+    concat_blocks = sum(
+        1 for item in (plan or [])
+        if item.get('is_concatenate') and _normalize_cte_name(item.get('concatenate_target') or '') == 'facttable'
+    )
+    has_explicit_concat = _has_explicit_facttable_concatenate(plan, qvs_script=qvs_script)
+    logger.info(
+        "EXPLICIT_CONCAT_ENFORCER_ENTER plan_present=%s concat_blocks=%s",
+        bool(plan),
+        concat_blocks,
+    )
+    if not has_explicit_concat:
+        logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", False)
+        return sql
+    union_cte = _fact_expenses_cte_name(sql)
+    if not union_cte:
+        logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", False)
+        return sql
+    fact_cte, source_cte = _explicit_concat_target_source_ctes(sql, plan)
+    if not fact_cte:
+        fact_cte = 'facttable' if _cte_body_for(sql, 'facttable') else ('fact_table' if _cte_body_for(sql, 'fact_table') else '')
+    if not source_cte:
+        source_cte = 'expenses' if _cte_body_for(sql, 'expenses') else ''
+    logger.info("EXPLICIT_CONCAT_ENFORCER_TARGET target=%s source=%s", fact_cte, source_cte)
+    if not fact_cte or not source_cte:
+        logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", False)
+        return _mark_dynamic_union_rebuild_failed(sql)
+    if not _cte_body_for(sql, fact_cte) or not _cte_body_for(sql, source_cte):
+        logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", False)
+        return _mark_dynamic_union_rebuild_failed(sql)
+
+    lineage_map = _cte_columns_by_name(sql)
+    fact_cols = extract_cte_output_column_map(sql, fact_cte, lineage_map=lineage_map)
+    union_cols_before = extract_cte_output_column_map(sql, union_cte, lineage_map=lineage_map)
+    source_cols = extract_cte_output_column_map(sql, source_cte, lineage_map=lineage_map)
+    removed_source_only = sorted(
+        raw for norm, raw in source_cols.items()
+        if norm in union_cols_before and norm not in fact_cols
+    )
+    logger.info("EXPLICIT_CONCAT_ENFORCER_TARGET_COLS cols=%s", list(fact_cols.values()))
+    logger.info("EXPLICIT_CONCAT_ENFORCER_SOURCE_ONLY removed=%s", removed_source_only)
+
+    effective_plan = plan
+    if _explicit_concatenate_fields_for_target(plan, 'FactTable', source_cte) is None and qvs_script:
+        qvs_fields = _explicit_facttable_concat_fields_from_qvs(qvs_script)
+        if qvs_fields:
+            effective_plan = [{
+                'table': source_cte,
+                'source': source_cte,
+                'source_tables': [source_cte],
+                'fields': list(qvs_fields),
+                'is_concatenate': True,
+                'concatenate_target': 'FactTable',
+            }]
+    union_body = _build_dynamic_fact_expenses_union_body(sql, fact_cte, source_cte, plan=effective_plan)
+    if not union_body:
+        logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", False)
+        return _mark_dynamic_union_rebuild_failed(sql)
+    before_body = _cte_body_for(sql, union_cte)
+    changed = before_body.strip() != union_body.strip()
+    logger.info(
+        "EXPLICIT_CONCAT_SCHEMA_ENFORCED target=%s source=%s target_cols=%s removed_source_only=%s",
+        fact_cte,
+        source_cte,
+        len(fact_cols),
+        removed_source_only,
+    )
+    logger.info("EXPLICIT_CONCAT_ENFORCER_EXIT changed=%s", changed)
+    enforced = _replace_cte_body(sql, union_cte, union_body)
+    marker = '-- EXPLICIT_CONCAT_SCHEMA_ENFORCED'
+    if marker not in enforced:
+        enforced = enforced.rstrip() + '\n' + marker + '\n'
+    return enforced
+
+
+def _build_dynamic_fact_expenses_union_body(sql: str, fact_cte: str, expenses_cte: str, plan=None) -> str:
+    if not fact_cte or not expenses_cte:
+        return ''
+    lineage_map = _cte_columns_by_name(sql)
+    fact_cols_map = extract_cte_output_column_map(sql, fact_cte, lineage_map=lineage_map)
+    expense_cols_map = extract_cte_output_column_map(sql, expenses_cte, lineage_map=lineage_map)
+    if not fact_cols_map or not expense_cols_map:
+        return ''
+
+    explicit_concat_fields = _explicit_concatenate_fields_for_target(
+        plan,
+        _target_table_for_fact_cte(fact_cte),
+        expenses_cte,
+    )
+    union_cols = list(fact_cols_map.items())
+    if explicit_concat_fields is None:
+        for norm, raw in expense_cols_map.items():
+            if norm not in fact_cols_map:
+                union_cols.append((norm, raw))
+
+    def typed_null(raw_column: str) -> str:
+        return f'CAST(NULL AS {_infer_sql_type_from_name(raw_column)}) AS {_sql_column_ref(raw_column)}'
+
+    first_rendered = []
+    for norm, raw in union_cols:
+        fact_col = fact_cols_map.get(norm)
+        first_rendered.append(_sql_column_ref(fact_col) if fact_col else typed_null(raw))
+
+    second_rendered = []
+    for norm, raw in union_cols:
+        expense_col = expense_cols_map.get(norm)
+        if explicit_concat_fields is not None and norm not in explicit_concat_fields:
+            expense_col = None
+        second_rendered.append(_sql_column_ref(expense_col) if expense_col else typed_null(raw))
+
+    return (
+        '\nSELECT\n    '
+        + ',\n    '.join(first_rendered)
+        + f'\nFROM {fact_cte}\n\nUNION ALL\n\nSELECT\n    '
+        + ',\n    '.join(second_rendered)
+        + f'\nFROM {expenses_cte}\n'
+    )
+
+
+def _ensure_facttable_with_expenses_cte(sql: str) -> str:
+    if _fact_expenses_cte_name(sql):
+        return sql
+    fact_cte = 'facttable' if _cte_body_for(sql, 'facttable') else ('fact_table' if _cte_body_for(sql, 'fact_table') else '')
+    expenses_cte = 'expenses' if _cte_body_for(sql, 'expenses') else ''
+    if not fact_cte or not expenses_cte:
+        return _mark_dynamic_union_rebuild_failed(sql)
+
+    union_body = _build_dynamic_fact_expenses_union_body(sql, fact_cte, expenses_cte)
+    if not union_body:
+        return _mark_dynamic_union_rebuild_failed(sql)
+
+    final_match = re.search(r'\b(final_model|final_mart)\s+AS\s*\(', sql, flags=re.IGNORECASE)
+    cte_def = f'facttable_with_expenses AS ({union_body})'
+    if final_match:
+        insert_at = final_match.start()
+        prefix = sql[:insert_at].rstrip()
+        suffix = sql[insert_at:]
+        sep = ',\n' if not prefix.endswith(',') else '\n'
+        return prefix + sep + cte_def + ',\n' + suffix
+    # fallback: append at end of WITH chain
+    select_matches = list(re.finditer(r'\bSELECT\b', sql, flags=re.IGNORECASE))
+    if not select_matches:
+        return _mark_dynamic_union_rebuild_failed(sql)
+    insert_at = select_matches[-1].start()
+    prefix = sql[:insert_at].rstrip()
+    suffix = sql[insert_at:]
+    sep = ',\n' if not prefix.endswith(',') else '\n'
+    return prefix + sep + cte_def + '\n' + suffix
+
+
+def rewrite_final_model_to_use_fact_expenses(sql: str) -> str:
+    """
+    Rewrite final_model to use facttable_with_expenses and remove direct expenses join/projections.
+    """
+    target_cte = 'final_model' if _cte_body_for(sql, 'final_model') else ('final_mart' if _cte_body_for(sql, 'final_mart') else '')
+    if not target_cte:
+        return sql
+    body = _cte_body_for(sql, target_cte)
+    if not body:
+        return sql
+
+    from_match = re.search(
+        r'\bFROM\s+(facttable_with_expenses|fact_table_with_expenses|facttable|fact_table)\s+(?:AS\s+)?(?P<fact_alias>[A-Za-z_][A-Za-z0-9_]*)\b',
+        body,
+        flags=re.IGNORECASE,
+    )
+    join_match = re.search(
+        r'\b(?:LEFT|RIGHT|FULL|INNER)?\s*JOIN\s+expenses\s+(?:AS\s+)?(?P<exp_alias>[A-Za-z_][A-Za-z0-9_]*)\s+ON\b',
+        body,
+        flags=re.IGNORECASE,
+    )
+    if not from_match or not join_match:
+        return sql
+
+    exp_alias = join_match.group('exp_alias')
+
+    # Replace FROM source to facttable_with_expenses preserving alias.
+    body = re.sub(
+        r'\bFROM\s+(facttable|fact_table)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b',
+        r'FROM facttable_with_expenses \2',
+        body,
+        flags=re.IGNORECASE,
+        count=1,
+    )
+
+    body = remove_join_clause(body, exp_alias)
+    body = _remove_select_items_for_alias(body, exp_alias)
+    body = _cleanup_leftover_expenses_alias_refs(sql, body, exp_alias)
+
+    return _replace_cte_body(sql, target_cte, body)
+
+
+def repair_concat_union_from_plan(sql_text: str, plan=None) -> str:
+    """Deterministically enforce CONCATENATE/UNION invariants from parsed plan metadata."""
+    sql = sql_text or ''
+    if not plan:
+        sql = enforce_expenses_yyyymm_coercion(sql)
+        return enforce_facttable_expenses_schema(sql)
+
+    has_concat = any(item.get('is_concatenate') for item in (plan or []))
+    has_fact_expenses_union = bool(
+        re.search(
+            r'(?is)\bfacttable_with_expenses\s+AS\s*\(.*?\bUNION\s+ALL\b',
+            sql,
+        )
+    )
+    if not has_concat and not has_fact_expenses_union:
+        return sql
+
+    sql = enforce_expenses_yyyymm_coercion(sql)
+    sql = enforce_facttable_expenses_schema(sql, plan=plan)
     sql = enforce_explicit_union_columns(sql)
+    if has_union_star_branch(sql):
+        sql = rebuild_facttable_with_expenses_union(sql, plan)
+    return sql
+
+
+def rebuild_facttable_with_expenses_union(sql_text: str, plan=None) -> str:
+    """Dynamically rebuild facttable_with_expenses UNION from parsed CTE schemas."""
+    sql = sql_text or ''
+    union_cte = _fact_expenses_cte_name(sql)
+    if not union_cte:
+        return sql
+    union_body = _cte_body_for(sql, union_cte)
+    if not union_body:
+        return sql
+
+    branches = re.split(r'\bUNION\s+ALL\b', union_body, flags=re.IGNORECASE)
+    explicit_target_cte, explicit_source_cte = _explicit_concat_target_source_ctes(sql, plan)
+    if explicit_target_cte and explicit_source_cte:
+        fact_cte = explicit_target_cte
+        expenses_cte = explicit_source_cte
+    else:
+        first_source = _select_source(branches[0]) if len(branches) >= 1 else ''
+        second_source = _select_source(branches[1]) if len(branches) >= 2 else ''
+
+        if first_source:
+            fact_cte = first_source
+        elif _cte_body_for(sql, 'facttable'):
+            fact_cte = 'facttable'
+        elif _cte_body_for(sql, 'fact_table'):
+            fact_cte = 'fact_table'
+        else:
+            fact_cte = ''
+
+        if _cte_body_for(sql, 'expenses'):
+            expenses_cte = 'expenses'
+        else:
+            expenses_cte = second_source
+
+    if not fact_cte or not expenses_cte:
+        return _mark_dynamic_union_rebuild_failed(sql)
+    if not _cte_body_for(sql, fact_cte) or not _cte_body_for(sql, expenses_cte):
+        return _mark_dynamic_union_rebuild_failed(sql)
+
+    # Keep Executive Dashboard semantics: explicit CONCATENATE (FactTable)
+    # must use the target fact CTE as the base branch, never a nearby budget or
+    # unrelated CTE selected from a malformed existing union.
+    if explicit_target_cte and _normalize_cte_name(fact_cte) not in {'facttable', 'fact_table'}:
+        return _mark_dynamic_union_rebuild_failed(sql)
+
+    union_body_new = _build_dynamic_fact_expenses_union_body(sql, fact_cte, expenses_cte, plan=plan)
+    if not union_body_new:
+        return _mark_dynamic_union_rebuild_failed(sql)
+    sql = _replace_cte_body(sql, union_cte, union_body_new)
+    return sql
+
+
+def preserve_hyphenated_source_names(sql_text: str, plan=None) -> str:
+    """Restore exact hyphenated Qlik source names in dbt source() calls when plan metadata has them."""
+    sql = sql_text or ''
+    replacements = {}
+    for item in plan or []:
+        for source in item.get('source_tables') or []:
+            exact_ref = _resolve_source_reference(source)
+            match = re.search(r"source\s*\(\s*'raw'\s*,\s*'([^']+)'\s*\)", exact_ref)
+            exact = match.group(1) if match else ''
+            if '-' not in exact:
+                continue
+            replacements[exact.replace('-', '_').lower()] = exact
+    if not replacements:
+        return sql
+
+    def repl(match):
+        source_name = match.group(2)
+        exact = replacements.get(source_name.lower())
+        if not exact:
+            return match.group(0)
+        return "{{ source('" + match.group(1) + "', '" + exact + "') }}"
+
+    return re.sub(
+        r"\{\{\s*source\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}",
+        repl,
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+
+def enforce_clean_historyflag_logic(sql_text: str) -> str:
+    """Use the direct Qlik monthstart comparison for generated HistoryFlag CTEs."""
+    sql = sql_text or ''
+    replacement = (
+        "CASE\n"
+        "    WHEN yyyymm <= DATE_TRUNC('month', TO_DATE('2013-05-31'))\n"
+        "    THEN 1 ELSE 0\n"
+        "END AS _historyflag"
+    )
+    return re.sub(
+        r'(?is)CASE\s+WHEN\s+[^;]*?(?:2013-05-31|DATEADD\s*\(|monthstart|makedate)[^;]*?END\s+AS\s+"?_?historyflag"?',
+        replacement,
+        sql,
+    )
+
+
+def finalize_generated_sql(sql_text: str, plan=None, qvs_script='') -> str:
+    """Apply deterministic post-repair invariants before validation/return."""
+    logger.info(
+        "FINALIZE_CONTEXT plan_size=%s has_expenses_concat=%s",
+        len(plan or []),
+        plan_has_expenses_concatenate(plan),
+    )
+    sql = normalize_dbt_config_braces(sql_text or '')
+    sql = preserve_hyphenated_source_names(sql, plan=plan)
+    sql = enforce_global_yyyymm_dateadd_coercion(sql)
+    sql = enforce_clean_historyflag_logic(sql)
+    sql = enforce_expenses_yyyymm_coercion(sql)
+    if _needs_fact_expenses_dynamic_rebuild(sql):
+        sql = rebuild_facttable_with_expenses_union(sql, plan=plan)
+    if fact_expenses_cte_has_alias_star(sql):
+        sql = expand_fact_expenses_alias_star(sql)
+    if plan_has_expenses_concatenate(plan) and final_model_has_bad_expenses_join(sql):
+        sql = _ensure_facttable_with_expenses_cte(sql)
+        sql = rebuild_facttable_with_expenses_union(sql, plan=plan)
+        if fact_expenses_cte_has_alias_star(sql):
+            sql = expand_fact_expenses_alias_star(sql)
+        sql = rewrite_final_model_to_use_fact_expenses(sql)
+    sql = repair_concat_union_from_plan(sql, plan=plan)
+    sql = enforce_explicit_facttable_concatenate_schema(sql, plan=plan, qvs_script=qvs_script)
+    if fact_expenses_cte_has_alias_star(sql):
+        sql = expand_fact_expenses_alias_star(sql)
+    if _fact_expenses_cte_name(sql) and final_model_has_bad_expenses_join(sql):
+        sql = rewrite_final_model_to_use_fact_expenses(sql)
+    sql = enforce_facttable_region_schema(sql)
+    if not plan:
+        sql = enforce_explicit_union_columns(sql)
     sql = enforce_expenses_account_join(sql)
+    sql = remove_bad_expenses_monthly_join(sql)
+    sql = enforce_global_yyyymm_dateadd_coercion(sql)
+    sql = enforce_clean_historyflag_logic(sql)
+    sql = preserve_hyphenated_source_names(sql, plan=plan)
+    sql = enforce_explicit_facttable_concatenate_schema(sql, plan=plan, qvs_script=qvs_script)
+    if plan:
+        join_contract = build_join_contract(plan, qvs_script or '')
+        sql = compose_final_model_from_contract(sql, join_contract)
     sql = enforce_final_model_wrapper(sql)
+    sql = enrich_final_model_projection(sql)
     sql = enforce_complete_final_select(sql)
+    before_last = sql
+    sql = enforce_explicit_concat_target_schema(sql, plan=plan, qvs_script=qvs_script)
+    union_body = _cte_body_for(sql, _fact_expenses_cte_name(sql)) if _fact_expenses_cte_name(sql) else ''
+    logger.info(
+        "FINALIZE_LAST_STEP_EXPLICIT_CONCAT applied=%s has_account=%s has_expenseactual=%s has_expensebudget=%s",
+        before_last != sql or '-- EXPLICIT_CONCAT_SCHEMA_ENFORCED' in sql,
+        bool(re.search(r'(?i)\baccount\b', union_body)),
+        bool(re.search(r'(?i)\bexpenseactual\b', union_body)),
+        bool(re.search(r'(?i)\bexpensebudget\b', union_body)),
+    )
     return normalize_dbt_config_braces(sql)
 
 
@@ -1702,6 +2977,19 @@ def _sql_identifier_variants(name: str):
     compact = re.sub(r'[^a-z0-9]+', '', raw.lower())
     snake = re.sub(r'[^a-z0-9]+', '_', raw.lower()).strip('_')
     return {raw.lower(), compact, snake}
+
+
+def resolve_cte_column_reference(alias, column_name, cte_columns) -> str:
+    """Resolve alias.column to the display identifier exposed by a CTE."""
+    target_variants = _sql_identifier_variants(column_name)
+    if isinstance(cte_columns, dict):
+        iterable = cte_columns.values()
+    else:
+        iterable = cte_columns or []
+    for raw_col in iterable:
+        if target_variants & _sql_identifier_variants(raw_col):
+            return f'{alias}.{_sql_column_ref(raw_col)}'
+    return f'{alias}.{_sql_column_ref(column_name)}'
 
 
 def _same_identifier(left: str, right: str) -> bool:
@@ -1756,14 +3044,81 @@ def _cte_columns_by_name(sql_text: str, names=None):
     result = {}
     for name in names:
         cols = _select_output_columns(_cte_body_for(sql_text, name))
-        result[name.lower()] = cols
+        result[_normalize_cte_name(name)] = cols
     return result
 
 
+def _build_column_lineage_map(sql_text: str, plan=None):
+    """Return cte -> columns lineage used by alias.column integrity checks."""
+    lineage = {}
+    names = _cte_names(sql_text)
+    base_lineage = _cte_columns_by_name(sql_text, names=names)
+    for name in names:
+        col_map = extract_cte_output_column_map(sql_text, name, lineage_map=base_lineage)
+        lineage[_normalize_cte_name(name)] = list(col_map.keys())
+    for item in plan or []:
+        table = _safe_cte_name(item.get('table') or '')
+        if not table:
+            continue
+        cols = lineage.setdefault(_normalize_cte_name(table), [])
+        for field in item.get('fields') or []:
+            col = _normalize_column_token(_extract_output_column_name(field))
+            if col and col not in {c for c in cols}:
+                cols.append(col)
+    return lineage
+
+
+def _normalize_column_token(value: str) -> str:
+    value = str(value or '')
+    value = value.strip()
+    if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'") or (value[0] == '`' and value[-1] == '`') or (value[0] == '[' and value[-1] == ']')):
+        value = value[1:-1]
+    value = value.strip()
+    value = re.sub(r'\s+', ' ', value)
+    return value.lower()
+
+
+def _normalize_cte_name(name: str) -> str:
+    return re.sub(r'\s+', '', str(name or '').strip().strip('"').strip('`').strip('[]')).lower()
+
+
+_ALIAS_COL_RE = re.compile(
+    r'(?<![A-Za-z0-9_])'
+    r'(?P<alias>[A-Za-z_][A-Za-z0-9_]*)'
+    r'\s*\.\s*'
+    r'(?P<col>"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)',
+    re.IGNORECASE,
+)
+
+
+def iter_alias_column_refs(sql: str):
+    for m in _ALIAS_COL_RE.finditer(sql or ''):
+        alias = _normalize_column_token(m.group('alias'))
+        col = _normalize_column_token(m.group('col'))
+        yield alias, col, m.group(0)
+
+
+def extract_alias_to_cte_map(select_body: str) -> dict:
+    alias_map = {}
+    pattern = re.compile(
+        r'\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)?',
+        re.IGNORECASE,
+    )
+    reserved = {'on', 'where', 'left', 'right', 'full', 'inner', 'join', 'group', 'order', 'qualify'}
+    for match in pattern.finditer(select_body or ''):
+        relation = _normalize_cte_name(match.group(1))
+        alias = _normalize_column_token(match.group(2) or match.group(1))
+        if alias in reserved:
+            alias = _normalize_column_token(match.group(1))
+        alias_map[alias] = relation
+    return alias_map
+
+
 def _column_exists(columns, column_name: str) -> bool:
-    wanted = _sql_identifier_variants(column_name)
+    norm = _normalize_column_token(column_name)
     for col in columns or []:
-        if wanted & _sql_identifier_variants(col):
+        c_norm = _normalize_column_token(col)
+        if norm == c_norm:
             return True
     return False
 
@@ -1778,19 +3133,25 @@ def _cte_reference_counts(sql_text: str, names):
     return counts
 
 
-def _validate_alias_column_references(sql_text: str, names):
+def _validate_alias_column_references(sql_text: str, names, plan=None):
     """Ensure alias.column references in the final SELECT/JOIN tail exist on the alias relation."""
     issues = []
-    final_tail = _final_select_tail(sql_text)
-    alias_map = _alias_relation_map(final_tail)
-    cte_cols = _cte_columns_by_name(sql_text, names)
-    for match in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\."?([A-Za-z_][A-Za-z0-9_ \-+]*)"?', final_tail or ''):
-        alias = match.group(1).lower()
-        column = match.group(2)
+    select_scope = _cte_body_for(sql_text, 'final_model') or _cte_body_for(sql_text, 'final_mart') or _final_select_tail(sql_text)
+    alias_map = extract_alias_to_cte_map(select_scope)
+    cte_cols = _build_column_lineage_map(sql_text, plan=plan)
+    has_expenses_alias_e = bool(re.search(r'(?is)\bJOIN\s+expenses\s+(?:AS\s+)?e\b', select_scope or ''))
+    if not has_expenses_alias_e and 'e' not in alias_map and re.search(r'(?is)\be\.(?:\*|"?[A-Za-z_][A-Za-z0-9_ ]*"?)', select_scope or ''):
+        issues.append('SQL_CLEANUP_LEFTOVER_ALIAS_E: final_model references e.* after expenses join cleanup removed JOIN expenses e.')
+    # Match alias.column safely:
+    # - quoted identifiers: alias."Column Name"
+    # - unquoted identifiers: alias.column_name
+    # Avoid swallowing trailing "AS alias_name" into the column token.
+    for alias, column, raw_ref in iter_alias_column_refs(select_scope or ''):
         relation = alias_map.get(alias)
         if not relation:
+            issues.append(f'ALIAS_COLUMN_NOT_FOUND: alias {alias} is not defined in FROM/JOIN scope.')
             continue
-        columns = cte_cols.get(relation.lower())
+        columns = cte_cols.get(_normalize_cte_name(relation))
         if columns is None:
             continue
         # SELECT alias.* is valid if alias exists.
@@ -1798,14 +3159,1429 @@ def _validate_alias_column_references(sql_text: str, names):
             continue
         if not _column_exists(columns, column):
             issues.append(
-                f'JOIN_KEY_MISSING: alias {match.group(1)} references column "{column}" '
+                f'JOIN_KEY_MISSING: alias {alias} references column "{column}" '
                 f'but CTE {relation} does not expose that column.'
             )
             issues.append(
-                f'ALIAS_COLUMN_NOT_FOUND: alias {match.group(1)} references column "{column}" '
+                f'ALIAS_COLUMN_NOT_FOUND: alias {alias} references column "{column}" '
                 f'but CTE {relation} does not expose that column.'
             )
     return issues
+
+
+def remove_bad_expenses_monthly_join(sql_text: str) -> str:
+    """
+    If facttable_with_expenses/fact_table_with_expenses exists, remove any LEFT JOIN expenses
+    that joins only by MonthlyRegionKey/monthly_region_key.
+    """
+    sql = sql_text or ''
+    if not re.search(r'\bfact_?table_with_expenses\b', sql, re.IGNORECASE):
+        return sql
+    target_cte = 'final_model' if _cte_body_for(sql, 'final_model') else ('final_mart' if _cte_body_for(sql, 'final_mart') else '')
+    if not target_cte:
+        return sql
+    body = _cte_body_for(sql, target_cte)
+    if not body:
+        return sql
+    aliases = [
+        match.group(1)
+        for match in re.finditer(r'(?is)\bJOIN\s+expenses\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+ON\b', body)
+    ]
+    for alias in aliases:
+        body = remove_join_clause(body, alias)
+        body = _remove_select_items_for_alias(body, alias)
+        body = _cleanup_leftover_expenses_alias_refs(sql, body, alias)
+    body = _cleanup_leftover_expenses_alias_refs(sql, body, 'e')
+    return _replace_cte_body(sql, target_cte, body)
+
+
+def _projection_items_by_output(select_sql: str) -> dict:
+    select_body = _select_body(select_sql or '')
+    result = {}
+    for item in split_top_level_csv(re.sub(r'^\s*DISTINCT\b\s*', '', select_body, flags=re.IGNORECASE)):
+        out = extract_output_alias(item)
+        norm = _normalize_column_token(out)
+        if norm and norm not in result:
+            result[norm] = item.strip()
+    return result
+
+
+def _is_null_projection(expr: str) -> bool:
+    return bool(re.search(r'(?is)\bCAST\s*\(\s*NULL\s+AS\s+[A-Za-z0-9_()]+\s*\)|(?<![A-Za-z0-9_])NULL(?![A-Za-z0-9_])', expr or ''))
+
+
+def validate_fact_expenses_union_semantics(sql: str) -> list[str]:
+    issues = []
+    union_cte = _fact_expenses_cte_name(sql or '')
+    union_body = _cte_body_for(sql or '', union_cte) if union_cte else ''
+    if not union_body or not re.search(r'\bUNION\s+ALL\b', union_body, re.IGNORECASE):
+        return issues
+
+    branches = split_top_level_union_all(union_body)
+    if len(branches) < 2:
+        issues.append('INVALID_FACT_EXPENSES_UNION: facttable_with_expenses must have fact and expenses UNION ALL branches.')
+        return issues
+
+    fact_cte = 'facttable' if _cte_body_for(sql, 'facttable') else ('fact_table' if _cte_body_for(sql, 'fact_table') else '')
+    expenses_cte = 'expenses' if _cte_body_for(sql, 'expenses') else ''
+    if not fact_cte or not expenses_cte:
+        return issues
+
+    fact_map = extract_cte_output_column_map(sql, fact_cte, lineage_map=_cte_columns_by_name(sql))
+    expense_map = extract_cte_output_column_map(sql, expenses_cte, lineage_map=_cte_columns_by_name(sql))
+    fact_only = set(fact_map) - set(expense_map)
+    expense_only = set(expense_map) - set(fact_map)
+
+    fact_branch = branches[0]
+    expense_branch = next((branch for branch in branches[1:] if re.search(r'\bFROM\s+expenses\b', branch, re.IGNORECASE)), branches[-1])
+    fact_items = _projection_items_by_output(fact_branch)
+    expense_items = _projection_items_by_output(expense_branch)
+
+    bad_fact = sorted(col for col in expense_only if col in fact_items and not _is_null_projection(fact_items[col]))
+    if bad_fact:
+        issues.append(
+            'INVALID_FACT_BRANCH_OWNERSHIP: fact branch must emit typed NULLs for expense-owned columns: '
+            + ', '.join(bad_fact)
+        )
+    bad_expense = sorted(col for col in fact_only if col in expense_items and not _is_null_projection(expense_items[col]))
+    if bad_expense:
+        issues.append(
+            'INVALID_EXPENSES_BRANCH_OWNERSHIP: expenses branch must emit typed NULLs for fact-only columns: '
+            + ', '.join(bad_expense)
+        )
+
+    final_body = extract_cte_body(sql, 'final_model') or extract_cte_body(sql, 'final_mart')
+    if final_body and re.search(r'(?is)\bJOIN\s+expenses\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*\b', final_body):
+        issues.append('LEFTOVER_EXPENSES_REJOIN: final_model must not rejoin expenses after facttable_with_expenses exists.')
+    if final_body and re.search(r'(?is)\be\.(?:\*|"?[A-Za-z_][A-Za-z0-9_ ]*"?)', final_body) and not re.search(r'(?is)\bJOIN\s+expenses\s+(?:AS\s+)?e\b', final_body):
+        issues.append('LEFTOVER_EXPENSES_REJOIN: final_model contains leftover expenses alias e references.')
+    return issues
+
+
+def validate_explicit_concatenate_field_parity(sql: str, plan, qvs_script: str = '') -> list[str]:
+    """Ensure explicit Qlik CONCATENATE LOAD fields do not widen the target table schema."""
+    issues = []
+    explicit_fields = _explicit_concatenate_fields_for_target(plan, 'FactTable', 'expenses')
+    if explicit_fields is None and _has_explicit_facttable_concatenate(plan, qvs_script=qvs_script):
+        explicit_fields = _explicit_facttable_concat_fields_from_qvs(qvs_script)
+    if explicit_fields is None:
+        return issues
+    union_cte = _fact_expenses_cte_name(sql or '')
+    if not union_cte:
+        return issues
+    fact_cte = 'facttable' if _cte_body_for(sql, 'facttable') else ('fact_table' if _cte_body_for(sql, 'fact_table') else '')
+    if not fact_cte:
+        return issues
+    union_cols = extract_cte_output_column_map(sql, union_cte, lineage_map=_cte_columns_by_name(sql))
+    fact_cols = extract_cte_output_column_map(sql, fact_cte, lineage_map=_cte_columns_by_name(sql))
+    expenses_cte = 'expenses' if _cte_body_for(sql, 'expenses') else ''
+    expense_cols = extract_cte_output_column_map(sql, expenses_cte, lineage_map=_cte_columns_by_name(sql)) if expenses_cte else {}
+    extra_union_cols = sorted(set(union_cols) - set(fact_cols))
+    if extra_union_cols:
+        issues.append(
+            'CONCATENATE_FIELD_PARITY_MISMATCH: facttable_with_expenses includes non-FactTable columns not loaded by explicit Qlik CONCATENATE: '
+            + ', '.join(extra_union_cols)
+        )
+        leaked_source_only = sorted(col for col in extra_union_cols if col in expense_cols and col not in explicit_fields)
+        if leaked_source_only:
+            issues.append(
+                'CONCATENATE_SOURCE_ONLY_FIELD_LEAK: explicit CONCATENATE (FactTable) leaked source-only Expenses fields into facttable_with_expenses: '
+                + ', '.join(leaked_source_only)
+            )
+    body = _cte_body_for(sql, union_cte)
+    branches = split_top_level_union_all(body)
+    expense_branch = next((branch for branch in branches[1:] if re.search(r'\bFROM\s+expenses\b', branch, re.IGNORECASE)), branches[-1] if len(branches) > 1 else '')
+    expense_items = _projection_items_by_output(expense_branch)
+    bad_direct = sorted(
+        col for col, expr in expense_items.items()
+        if col in union_cols and col not in explicit_fields and not _is_null_projection(expr)
+    )
+    if bad_direct:
+        issues.append(
+            'CONCATENATE_FIELD_PARITY_MISMATCH: expenses branch directly maps columns not present in explicit Qlik CONCATENATE field list: '
+            + ', '.join(bad_direct)
+        )
+        leaked_direct = sorted(col for col in bad_direct if col in expense_cols and col not in fact_cols)
+        if leaked_direct:
+            issues.append(
+                'CONCATENATE_SOURCE_ONLY_FIELD_LEAK: expenses branch directly maps source-only fields not present in the explicit Qlik CONCATENATE field list: '
+                + ', '.join(leaked_direct)
+            )
+    return issues
+
+
+def _plan_table_names(plan) -> set:
+    names = set()
+    for item in plan or []:
+        for value in (item.get('table'), item.get('source'), *(item.get('source_tables') or [])):
+            safe = _safe_cte_name(value or '')
+            if safe:
+                names.add(safe)
+    return names
+
+
+def validate_qlik_semantic_parity(sql: str, plan) -> list[str]:
+    issues = []
+    if not plan:
+        return issues
+    plan_names = _plan_table_names(plan)
+    lower_sql = (sql or '').lower()
+    final_body = (extract_cte_body(sql, 'final_model') or extract_cte_body(sql, 'final_mart') or _final_select_tail(sql)).lower()
+
+    if 'calendar' in plan_names:
+        if not ('calendar' in final_body and 'yyyymm' in final_body and re.search(r'fiscal\s*(year|quarter|month)|fiscal(year|quarter|month)', lower_sql)):
+            issues.append('MISSING_CALENDAR_ENRICHMENT: Calendar exists in Qlik plan but fiscal/yyyymm enrichment is incomplete.')
+
+    if {'itemmaster', 'productgroupmaster', 'producttypemaster'} & plan_names:
+        required = ('itembranchmaster', 'itemmaster')
+        product_dim_present = any(name in final_body for name in ('productgroupmaster', 'productsubgroupmaster', 'producttypemaster'))
+        if not (all(name in final_body for name in required) and product_dim_present):
+            issues.append('INCOMPLETE_PRODUCT_HIERARCHY: Product hierarchy exists in Qlik plan but final_model does not join item/product dimensions through the expected path.')
+
+    if any(name.startswith('arsummary') for name in plan_names):
+        if not ('arsummary' in final_body and 'custkeyar' in final_body):
+            issues.append('MISSING_AR_ENRICHMENT: ARSummary exists in Qlik plan but arsummary/custkeyar enrichment is incomplete.')
+
+    if 'customermaster' in plan_names:
+        if not ('customermaster' in final_body and ('address number' in final_body or 'address_number' in final_body)):
+            issues.append('MISSING_CUSTOMER_ENRICHMENT: CustomerMaster exists in Qlik plan but Address Number customer enrichment is incomplete.')
+
+    if {'regionalsales', 'budget'} & plan_names:
+        if not ('budget' in final_body and 'monthlyregionkey' in final_body):
+            issues.append('MISSING_BUDGET_ENRICHMENT: Budget/RegionalSales exists in Qlik plan but MonthlyRegionKey budget enrichment is incomplete.')
+    return issues
+
+
+def validate_execution_safety(sql: str) -> list[str]:
+    issues = []
+    content = sql or ''
+    if content.count('(') != content.count(')'):
+        issues.append('UNBALANCED_PARENS: parentheses look unbalanced.')
+    names = [_normalize_cte_name(name) for name in _cte_names(content)]
+    duplicates = sorted(name for name in set(names) if names.count(name) > 1)
+    if duplicates:
+        issues.append(f'DUPLICATE_CTE_NAME: duplicate CTE definitions detected: {", ".join(duplicates)}.')
+    if re.search(r'(?is)\bSELECT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*', content):
+        issues.append('SELECT_STAR_EXECUTION_RISK: generated SQL should enumerate projections explicitly before execution.')
+    if re.search(r'(?is)\bJOIN\s+[A-Za-z_][A-Za-z0-9_]*(?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?(?=\s*(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN\b|\s+WHERE\b|\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s*$)', content):
+        issues.append('JOIN_WITHOUT_ON: JOIN appears without an ON clause.')
+    if re.search(r'(?is)\bUNION\s+ALL\s*(?:\)|$)', content):
+        issues.append('MALFORMED_UNION: UNION ALL is missing a following SELECT branch.')
+    if re.search(r'(?i)AccountLEFT\s+JOIN', content):
+        issues.append('SQL_CLEANUP_CORRUPTION: AccountLEFT JOIN corruption detected.')
+    if re.search(r'(?im)^\s*AND\s+[A-Za-z_][A-Za-z0-9_]*\.[^\n]+JOIN\b', content):
+        issues.append('SQL_CLEANUP_CORRUPTION: dangling AND predicate appears before JOIN.')
+    issues.extend(_validate_alias_column_references(content, _cte_names(content)))
+    return list(dict.fromkeys(issues))
+
+
+def _score_add(passed, label, score, points):
+    passed.append(label)
+    return score + points
+
+
+def _score_warn(warnings, label, score, penalty):
+    warnings.append(label)
+    return max(0, score - penalty)
+
+
+def _score_fail(failures, label, score, penalty):
+    failures.append(label)
+    return max(0, score - penalty)
+
+
+def score_generated_sql_quality(sql, plan=None) -> dict:
+    """Score finalized SQL quality and completeness on a 0-100 scale."""
+    text = sql or ''
+    plan = plan or []
+    passed = []
+    warnings = []
+    failures = []
+    score = 0
+
+    cte_names = {_normalize_cte_name(name) for name in _cte_names(text)}
+    final_body = extract_cte_body(text, 'final_model') or extract_cte_body(text, 'final_mart')
+    final_lower = final_body.lower()
+    union_name = _fact_expenses_cte_name(text)
+    union_body = _cte_body_for(text, union_name) if union_name else ''
+
+    if final_body:
+        score = _score_add(passed, 'final_model exists', score, 12)
+    else:
+        score = _score_fail(failures, 'final_model missing', score, 18)
+
+    if plan_has_expenses_concatenate(plan):
+        if union_body:
+            score = _score_add(passed, 'facttable_with_expenses exists for expenses concatenate', score, 12)
+        else:
+            score = _score_fail(failures, 'facttable_with_expenses missing for expenses concatenate', score, 18)
+    elif union_body:
+        score = _score_add(passed, 'facttable_with_expenses exists', score, 8)
+
+    if re.search(r'(?is)\bJOIN\s+expenses\b', final_body):
+        score = _score_fail(failures, 'direct expenses join remains in final_model', score, 15)
+    else:
+        score = _score_add(passed, 'no direct expenses join in final_model', score, 10)
+
+    if union_body:
+        if re.search(r'(?is)\bSELECT\s+(?:[A-Za-z_][A-Za-z0-9_]*\.)?\*', union_body):
+            score = _score_fail(failures, 'SELECT * appears inside fact/expenses union', score, 15)
+        else:
+            score = _score_add(passed, 'fact/expenses union uses explicit columns', score, 10)
+        counts = _union_branch_column_counts(union_body)
+        if counts and len(set(counts)) == 1:
+            score = _score_add(passed, 'fact/expenses union branches aligned', score, 10)
+        else:
+            score = _score_fail(failures, f'fact/expenses union branches not aligned: {counts}', score, 15)
+
+    alias_issues = _validate_alias_column_references(text, _cte_names(text), plan=plan)
+    if alias_issues:
+        score = _score_fail(failures, 'undefined alias or alias column references found', score, 15)
+    else:
+        score = _score_add(passed, 'no undefined alias references', score, 10)
+
+    core_join_relations = {
+        'customermap': 'customer map joined',
+        'customermaster': 'customer master joined',
+        'arsummary': 'AR summary joined',
+    }
+    for relation, label in core_join_relations.items():
+        if relation in cte_names:
+            if re.search(rf'(?is)\bJOIN\s+{re.escape(relation)}\b', final_body):
+                score = _score_add(passed, label, score, 5)
+            else:
+                score = _score_warn(warnings, f'missing {label}', score, 3)
+
+    optional_join_relations = {
+        'historyflag': 'historyflag joined if present',
+        'budget': 'budget joined if present',
+        'calendar': 'calendar joined if present',
+        'salesrepmaster': 'sales rep master joined if present',
+        'itembranchmaster': 'item branch master joined if present',
+        'itemmaster': 'item master joined if present',
+        'productgroupmaster': 'product group master joined if present',
+        'productsubgroupmaster': 'product subgroup master joined if present',
+        'producttypemaster': 'product type master joined if present',
+    }
+    for relation, label in optional_join_relations.items():
+        if relation in cte_names:
+            if re.search(rf'(?is)\bJOIN\s+{re.escape(relation)}\b', final_body):
+                score = _score_add(passed, label, score, 3)
+            else:
+                score = _score_warn(warnings, f'missing {label}', score, 2)
+
+    semantic_issues = validate_fact_expenses_union_semantics(text)
+    if semantic_issues:
+        score = _score_fail(failures, 'fact/expenses union semantic issues: ' + '; '.join(semantic_issues), score, 12)
+    else:
+        score = _score_add(passed, 'fact/expenses union semantic checks passed', score, 8)
+
+    return {
+        'score': max(0, min(100, score)),
+        'passed': list(dict.fromkeys(passed)),
+        'warnings': list(dict.fromkeys(warnings)),
+        'failures': list(dict.fromkeys(failures)),
+    }
+
+
+def _plan_item_for_table(plan, table_name: str):
+    target = _normalize_cte_name(table_name)
+    for item in plan or []:
+        if _normalize_cte_name(item.get('table') or '') == target:
+            return item
+    return None
+
+
+def _plan_source_relation(plan, table_name: str) -> str:
+    item = _plan_item_for_table(plan, table_name)
+    if not item:
+        return table_name
+    source = item.get('source') or ''
+    if not source and item.get('source_tables'):
+        source = (item.get('source_tables') or [''])[0]
+    source_name = _resolve_source_reference(source or table_name)
+    return "{{ source('raw', '" + source_name + "') }}"
+
+
+def _validation_check(check_id: str, check_type: str, description: str, sql: str, severity: str = 'warning') -> dict:
+    return {
+        'id': check_id,
+        'type': check_type,
+        'description': description,
+        'severity': severity,
+        'status': 'not_run',
+        'sql': sql.strip(),
+    }
+
+
+def _sum_check_sql(model_name: str, field_name: str, source_relation: str = '') -> str:
+    field_ref = _sql_column_ref(field_name)
+    migrated = (
+        f"SELECT '{field_name}' AS metric_name, SUM({field_ref}) AS metric_total\n"
+        f"FROM {{{{ ref('{model_name}') }}}}"
+    )
+    if not source_relation:
+        return migrated
+    return (
+        "WITH source_total AS (\n"
+        f"    SELECT SUM({field_ref}) AS total_value FROM {source_relation}\n"
+        "), migrated_total AS (\n"
+        f"    SELECT SUM({field_ref}) AS total_value FROM {{{{ ref('{model_name}') }}}}\n"
+        ")\n"
+        f"SELECT '{field_name}' AS metric_name,\n"
+        "       source_total.total_value AS source_total,\n"
+        "       migrated_total.total_value AS migrated_total,\n"
+        "       migrated_total.total_value - source_total.total_value AS variance\n"
+        "FROM source_total CROSS JOIN migrated_total"
+    )
+
+
+def _breakdown_check_sql(model_name: str, dimension_name: str) -> str:
+    dim_ref = _sql_column_ref(dimension_name)
+    return (
+        f"SELECT {dim_ref} AS dimension_value,\n"
+        "       COUNT(*) AS row_count,\n"
+        "       SUM(COALESCE(\"Sales Amount\", 0)) AS sales_amount,\n"
+        "       SUM(COALESCE(ExpenseActual, 0)) AS expenseactual,\n"
+        "       SUM(COALESCE(ExpenseBudget, 0)) AS expensebudget\n"
+        f"FROM {{{{ ref('{model_name}') }}}}\n"
+        f"GROUP BY {dim_ref}\n"
+        f"ORDER BY {dim_ref}"
+    )
+
+
+def build_migration_validation_report(sql: str, plan=None, dialect: str = 'dbt', model_name: str = 'migration_output') -> dict:
+    """Build dbt compile and parity validation SQL without executing it."""
+    plan = plan or []
+    checks = []
+    fact_relation = _plan_source_relation(plan, 'FactTable')
+    expenses_relation = _plan_source_relation(plan, 'Expenses')
+
+    checks.append(_validation_check(
+        'facttable_count',
+        'row_count',
+        'Count rows in the Qlik FactTable source.',
+        f"SELECT COUNT(*) AS facttable_count\nFROM {fact_relation}",
+    ))
+    checks.append(_validation_check(
+        'expenses_count',
+        'row_count',
+        'Count rows in the Qlik Expenses source.',
+        f"SELECT COUNT(*) AS expenses_count\nFROM {expenses_relation}",
+    ))
+    checks.append(_validation_check(
+        'facttable_with_expenses_count',
+        'row_count',
+        'Validate migrated facttable_with_expenses row count equals FactTable plus Expenses.',
+        (
+            "WITH source_counts AS (\n"
+            f"    SELECT COUNT(*) AS facttable_count FROM {fact_relation}\n"
+            "), expense_counts AS (\n"
+            f"    SELECT COUNT(*) AS expenses_count FROM {expenses_relation}\n"
+            "), migrated_counts AS (\n"
+            f"    SELECT COUNT(*) AS migrated_count FROM {{{{ ref('{model_name}') }}}}\n"
+            ")\n"
+            "SELECT source_counts.facttable_count,\n"
+            "       expense_counts.expenses_count,\n"
+            "       migrated_counts.migrated_count,\n"
+            "       migrated_counts.migrated_count - (source_counts.facttable_count + expense_counts.expenses_count) AS variance\n"
+            "FROM source_counts CROSS JOIN expense_counts CROSS JOIN migrated_counts"
+        ),
+    ))
+
+    metric_sources = {
+        'Sales Amount': fact_relation,
+        'Sales Cost Amount': fact_relation,
+        'Sales Margin Amount': fact_relation,
+        'ExpenseActual': expenses_relation,
+        'ExpenseBudget': expenses_relation,
+        'Budget Amount': _plan_source_relation(plan, 'Budget'),
+    }
+    for metric_name, source_relation in metric_sources.items():
+        checks.append(_validation_check(
+            'sum_' + re.sub(r'[^a-z0-9]+', '_', metric_name.lower()).strip('_'),
+            'metric_total',
+            f'Compare total {metric_name} between Qlik source and migrated dbt model.',
+            _sum_check_sql(model_name, metric_name, source_relation),
+        ))
+
+    for dimension_name in ['Region', 'YYYYMM', 'Customer Number', 'Sales Rep', 'Product Group']:
+        checks.append(_validation_check(
+            'breakdown_by_' + re.sub(r'[^a-z0-9]+', '_', dimension_name.lower()).strip('_'),
+            'dimension_breakdown',
+            f'Validate migrated measures by {dimension_name}.',
+            _breakdown_check_sql(model_name, dimension_name),
+        ))
+
+    return {
+        'version': '2026-05-27.validation.v1',
+        'status': 'not_run',
+        'dialect': dialect or 'dbt',
+        'modelName': model_name,
+        'dbtCompile': {
+            'status': 'not_run',
+            'command': f'dbt compile --select {model_name}',
+            'description': 'Run after packaging the generated model in a dbt project to verify SQL compilation.',
+        },
+        'checks': checks,
+        'summary': {
+            'totalChecks': len(checks),
+            'rowCountChecks': len([c for c in checks if c['type'] == 'row_count']),
+            'metricTotalChecks': len([c for c in checks if c['type'] == 'metric_total']),
+            'dimensionBreakdownChecks': len([c for c in checks if c['type'] == 'dimension_breakdown']),
+        },
+    }
+
+
+def _strip_trailing_semicolon(sql: str) -> str:
+    return re.sub(r';+\s*$', '', str(sql or '').strip())
+
+
+def _artifact_column_names(sql: str) -> list[str]:
+    columns = extract_cte_output_columns(sql or '', 'final_model') or extract_cte_output_columns(sql or '', 'final_mart')
+    if columns:
+        return columns
+    tail = _final_select_tail(sql or '')
+    if tail:
+        return extract_projection_display_names(tail)
+    return []
+
+
+def _artifact_has_column(columns, name: str) -> bool:
+    target = _normalize_column_token(name)
+    return any(_normalize_column_token(column) == target for column in columns or [])
+
+
+def _artifact_model_ref(model_name: str) -> str:
+    safe_name = re.sub(r'[^A-Za-z0-9_]+', '_', str(model_name or 'executive_dashboard')).strip('_') or 'executive_dashboard'
+    return "{{ ref('" + safe_name + "') }}"
+
+
+def _artifact_noop_test(reason: str) -> str:
+    escaped = str(reason or 'validation skipped').replace("'", "''")
+    return f"SELECT '{escaped}' AS skipped_reason\nWHERE 1 = 0"
+
+
+def sanitize_test_sql_projection(sql: str) -> str:
+    """Keep dbt singular tests explicit: no SELECT * failure projections."""
+    text = str(sql or '').strip()
+    text = re.sub(
+        r'(?is)\bSELECT\s+\*\s+FROM\s*\(\s*(?P<inner>.*?)\s*\)\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s+WHERE\s+COALESCE\s*\(\s*variance\s*,\s*0\s*\)\s*!=\s*0\s*$',
+        (
+            "SELECT\n"
+            "    migrated_count,\n"
+            "    facttable_count + expenses_count AS expected_count,\n"
+            "    variance AS difference\n"
+            "FROM (\n"
+            "\\g<inner>\n"
+            ") \\g<alias>\n"
+            "WHERE COALESCE(variance, 0) != 0"
+        ),
+        text,
+    )
+    text = re.sub(
+        r'(?is)\bSELECT\s+\*\s+FROM\s+keyed\s+WHERE\s+row_count\s*>\s*1\s*$',
+        (
+            "SELECT\n"
+            "    1 AS validation_failure,\n"
+            "    row_count\n"
+            "FROM keyed\n"
+            "WHERE row_count > 1"
+        ),
+        text,
+    )
+    return text
+
+
+def _artifact_not_null_test(model_name: str, column: str, test_name: str, predicate: str = '') -> str:
+    col_ref = _sql_column_ref(column)
+    where = f"{col_ref} IS NULL"
+    if predicate:
+        where = f"({predicate}) AND {where}"
+    return (
+        f"SELECT '{test_name}' AS validation_name, COUNT(*) AS failing_rows\n"
+        f"FROM {_artifact_model_ref(model_name)}\n"
+        f"WHERE {where}\n"
+        "HAVING COUNT(*) > 0"
+    )
+
+
+def _artifact_metric_totals_sql(model_name: str, columns) -> str:
+    metrics = [
+        'Sales Amount',
+        'Sales Cost Amount',
+        'Sales Margin Amount',
+        'ExpenseActual',
+        'ExpenseBudget',
+        'Budget Amount',
+        'AROpen',
+        'ARGross',
+    ]
+    selects = []
+    for metric in metrics:
+        if _artifact_has_column(columns, metric):
+            metric_ref = _sql_column_ref(metric)
+            selects.append(f"SELECT '{metric}' AS metric_name, SUM({metric_ref}) AS metric_total FROM {_artifact_model_ref(model_name)}")
+    return '\nUNION ALL\n'.join(selects) if selects else _artifact_noop_test('No metric columns detected for totals analysis')
+
+
+def _artifact_breakdown_sql(model_name: str, columns, dimension: str) -> str:
+    if not _artifact_has_column(columns, dimension):
+        return _artifact_noop_test(f'{dimension} column not detected for breakdown analysis')
+    dim_ref = _sql_column_ref(dimension)
+    measure_exprs = ["COUNT(*) AS row_count"]
+    for metric in ['Sales Amount', 'ExpenseActual', 'ExpenseBudget', 'Budget Amount', 'AROpen', 'ARGross']:
+        if _artifact_has_column(columns, metric):
+            metric_ref = _sql_column_ref(metric)
+            alias = re.sub(r'[^a-z0-9]+', '_', metric.lower()).strip('_')
+            measure_exprs.append(f"SUM(COALESCE({metric_ref}, 0)) AS {alias}")
+    return (
+        f"SELECT {dim_ref} AS dimension_value,\n"
+        "       " + ',\n       '.join(measure_exprs) + "\n"
+        f"FROM {_artifact_model_ref(model_name)}\n"
+        f"GROUP BY {dim_ref}\n"
+        f"ORDER BY {dim_ref}"
+    )
+
+
+def _validation_report_check_sql(validation_report: dict, check_id: str) -> str:
+    for check in (validation_report or {}).get('checks') or []:
+        if check.get('id') == check_id:
+            return _strip_trailing_semicolon(check.get('sql') or '')
+    return ''
+
+
+def _source_names_for_artifacts(sql: str) -> list[str]:
+    names = []
+    seen = set()
+    for match in re.finditer(
+        r"\{\{\s*source\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}",
+        sql or '',
+        flags=re.IGNORECASE,
+    ):
+        source_name = match.group(2)
+        key = source_name.lower()
+        if key not in seen:
+            seen.add(key)
+            names.append(source_name)
+    return names
+
+
+def _schema_yml_for_validation_artifacts(sql: str, model_name: str, columns) -> str:
+    sources = _source_names_for_artifacts(sql)
+    lines = ["version: 2", "", "sources:", "  - name: raw", "    tables:"]
+    if sources:
+        for source in sources:
+            lines.append(f"      - name: {source}")
+    else:
+        lines.append("      - name: source_table")
+    lines.extend(["", "models:", f"  - name: {model_name}", "    columns:"])
+    if columns:
+        for column in columns:
+            col_name = str(column or '').strip().strip('"')
+            if not col_name:
+                continue
+            lines.append(f"      - name: {col_name}")
+            tests = []
+            if _normalize_column_token(col_name) in {'monthlyregionkey', 'yyyymm', 'custkey', 'account'}:
+                tests.append('not_null')
+            if _normalize_column_token(col_name) == '_historyflag':
+                tests.append('accepted_values')
+            if tests:
+                lines.append("        data_tests:")
+                for test in tests:
+                    if test == 'accepted_values':
+                        lines.append("          - accepted_values:")
+                        lines.append("              values: [0, 1]")
+                    else:
+                        lines.append(f"          - {test}")
+    else:
+        lines.append("      - name: generated_row")
+    return '\n'.join(lines)
+
+
+def generate_validation_artifacts(sql: str, validation_report: dict, model_name='executive_dashboard') -> dict:
+    """Generate dbt model, singular tests, analyses, and schema YAML for SQL validation."""
+    safe_model = re.sub(r'[^A-Za-z0-9_]+', '_', str(model_name or 'executive_dashboard')).strip('_') or 'executive_dashboard'
+    sql_text = _strip_trailing_semicolon(sql or '')
+    columns = _artifact_column_names(sql_text)
+    lower_sql = (sql_text or '').lower()
+
+    tests = {}
+    row_count_sql = _validation_report_check_sql(validation_report, 'facttable_with_expenses_count')
+    if row_count_sql:
+        tests['assert_fact_expenses_row_count.sql'] = (
+            "SELECT\n"
+            "    migrated_count,\n"
+            "    facttable_count + expenses_count AS expected_count,\n"
+            "    variance AS difference\n"
+            "FROM (\n"
+            f"{row_count_sql}\n"
+            ") counts\n"
+            "WHERE COALESCE(variance, 0) != 0"
+        )
+    else:
+        tests['assert_fact_expenses_row_count.sql'] = _artifact_noop_test('Row count validation SQL was not generated')
+
+    fact_predicate = ''
+    expense_predicate = ''
+    if _artifact_has_column(columns, 'ExpenseActual'):
+        fact_predicate = 'ExpenseActual IS NULL'
+        expense_predicate = 'ExpenseActual IS NOT NULL'
+    elif _artifact_has_column(columns, 'ExpenseBudget'):
+        fact_predicate = 'ExpenseBudget IS NULL'
+        expense_predicate = 'ExpenseBudget IS NOT NULL'
+
+    tests['assert_no_null_monthlyregionkey.sql'] = (
+        _artifact_not_null_test(safe_model, 'MonthlyRegionKey', 'assert_no_null_monthlyregionkey', fact_predicate)
+        if _artifact_has_column(columns, 'MonthlyRegionKey')
+        else _artifact_noop_test('MonthlyRegionKey column not detected')
+    )
+    tests['assert_no_null_yyyymm.sql'] = (
+        _artifact_not_null_test(safe_model, 'YYYYMM', 'assert_no_null_yyyymm', fact_predicate)
+        if _artifact_has_column(columns, 'YYYYMM')
+        else _artifact_noop_test('YYYYMM column not detected')
+    )
+    tests['assert_sales_amount_not_null.sql'] = (
+        _artifact_not_null_test(safe_model, 'Sales Amount', 'assert_sales_amount_not_null', fact_predicate)
+        if _artifact_has_column(columns, 'Sales Amount')
+        else _artifact_noop_test('Sales Amount column not detected')
+    )
+    tests['assert_expenseactual_not_null.sql'] = (
+        _artifact_not_null_test(safe_model, 'ExpenseActual', 'assert_expenseactual_not_null', expense_predicate)
+        if _artifact_has_column(columns, 'ExpenseActual')
+        else _artifact_noop_test('ExpenseActual column not detected')
+    )
+    key_candidates = ['MonthlyRegionKey', 'CustKey', 'YYYYMM', 'Account']
+    available_keys = [column for column in key_candidates if _artifact_has_column(columns, column)]
+    if len(available_keys) >= 2:
+        partition = ', '.join(_sql_column_ref(column) for column in available_keys)
+        tests['assert_no_duplicate_impossible_key.sql'] = (
+            "WITH keyed AS (\n"
+            f"    SELECT {partition}, COUNT(*) AS row_count\n"
+            f"    FROM {_artifact_model_ref(safe_model)}\n"
+            f"    GROUP BY {partition}\n"
+            ")\n"
+            "SELECT\n"
+            "    1 AS validation_failure,\n"
+            "    row_count\n"
+            "FROM keyed\n"
+            "WHERE row_count > 1"
+        )
+    else:
+        tests['assert_no_duplicate_impossible_key.sql'] = _artifact_noop_test('Not enough key columns detected for duplicate-key assertion')
+    tests['assert_no_dangling_null_region.sql'] = (
+        _artifact_not_null_test(safe_model, 'Region', 'assert_no_dangling_null_region', fact_predicate)
+        if _artifact_has_column(columns, 'Region')
+        else _artifact_noop_test('Region column not detected')
+    )
+    tests['assert_no_direct_expenses_rejoin.sql'] = (
+        "SELECT 'direct expenses rejoin detected in generated SQL' AS validation_error\nWHERE 1 = 1"
+        if re.search(r'(?is)\bJOIN\s+expenses\b', sql_text)
+        else "SELECT 'no direct expenses rejoin detected' AS validation_name\nWHERE 1 = 0"
+    )
+
+    analyses = {
+        'metric_totals.sql': _artifact_metric_totals_sql(safe_model, columns),
+        'region_breakdown.sql': _artifact_breakdown_sql(safe_model, columns, 'Region'),
+        'month_breakdown.sql': _artifact_breakdown_sql(safe_model, columns, 'YYYYMM'),
+        'customer_breakdown.sql': _artifact_breakdown_sql(safe_model, columns, 'Customer Number'),
+        'sales_rep_breakdown.sql': _artifact_breakdown_sql(safe_model, columns, 'Sales Rep'),
+        'product_breakdown.sql': _artifact_breakdown_sql(safe_model, columns, 'Product Group'),
+    }
+
+    tests = {name: _strip_trailing_semicolon(sanitize_test_sql_projection(value)) for name, value in tests.items()}
+    analyses = {name: _strip_trailing_semicolon(value) for name, value in analyses.items()}
+    return {
+        'models': {
+            f'{safe_model}.sql': sql_text,
+        },
+        'tests': tests,
+        'analyses': analyses,
+        'schema_yml': _schema_yml_for_validation_artifacts(sql_text, safe_model, columns),
+    }
+
+
+def generate_dbt_project_scaffold(project_name='qlik_migration_validation') -> dict:
+    """Return minimal dbt project files for exported validation artifacts."""
+    safe_project = re.sub(r'[^A-Za-z0-9_]+', '_', str(project_name or 'qlik_migration_validation')).strip('_')
+    safe_project = safe_project or 'qlik_migration_validation'
+    dbt_project = (
+        f"name: {safe_project}\n"
+        "version: '1.0.0'\n"
+        "config-version: 2\n"
+        f"profile: {safe_project}\n"
+        "\n"
+        'model-paths: ["models"]\n'
+        'test-paths: ["tests"]\n'
+        'analysis-paths: ["analyses"]\n'
+        'target-path: "target"\n'
+        'clean-targets: ["target", "dbt_packages"]\n'
+        "\n"
+        "models:\n"
+        f"  {safe_project}:\n"
+        "    +materialized: table\n"
+    )
+    readme = (
+        f"# {safe_project}\n\n"
+        "This folder contains generated dbt validation artifacts for a Qlik migration.\n\n"
+        "You can copy this folder into an existing dbt project, or run it as a standalone dbt project after configuring a warehouse connection.\n\n"
+        "Before running, configure `profiles.yml` locally or set up the equivalent dbt Cloud connection for this project/profile.\n\n"
+        "Recommended validation flow:\n\n"
+        "```bash\n"
+        "dbt compile\n"
+        "dbt run --select executive_dashboard\n"
+        "dbt test\n"
+        "dbt compile --select analyses\n"
+        "```\n\n"
+        "The singular tests return failing rows. A test passes when it returns zero rows.\n"
+    )
+    return {
+        'dbt_project.yml': dbt_project,
+        'packages.yml': '',
+        'README.md': readme,
+        '.gitignore': "target/\ndbt_packages/\nlogs/\n.env\n",
+    }
+
+
+def _validation_artifacts_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'generated_artifacts'))
+
+
+def _sanitize_artifact_filename(name: str, default_name: str = 'artifact.sql') -> str:
+    basename = os.path.basename(str(name or '').replace('\\', '/'))
+    if basename == '.gitignore':
+        return basename
+    basename = re.sub(r'[^A-Za-z0-9_.-]+', '_', basename).strip('._')
+    return basename or default_name
+
+
+def _resolve_validation_output_dir(output_dir: str) -> str:
+    root = _validation_artifacts_root()
+    raw = str(output_dir or '').strip()
+    if not raw:
+        raw = 'validation_export'
+    if os.path.isabs(raw):
+        resolved = os.path.abspath(raw)
+    else:
+        resolved = os.path.abspath(os.path.join(root, raw))
+    if os.path.commonpath([root, resolved]) != root:
+        raise ValueError('output_dir must be inside generated_artifacts')
+    return resolved
+
+
+def _write_validation_artifact_file(base_dir: str, relative_dir: str, filename: str, content, files_written: list, errors: list):
+    safe_name = _sanitize_artifact_filename(filename)
+    target_dir = os.path.join(base_dir, relative_dir)
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.abspath(os.path.join(target_dir, safe_name))
+    if os.path.commonpath([base_dir, target_path]) != base_dir:
+        errors.append(f'Blocked unsafe artifact path: {filename}')
+        return
+    try:
+        with open(target_path, 'w', encoding='utf-8') as handle:
+            handle.write(str(content or '').rstrip() + '\n')
+        files_written.append(os.path.relpath(target_path, base_dir))
+    except Exception as exc:
+        errors.append(f'Failed to write {safe_name}: {exc}')
+
+
+def generate_export_manifest(validation_artifacts, export_result, metadata=None) -> dict:
+    """Build a self-describing manifest for exported dbt validation artifacts."""
+    artifacts = validation_artifacts or {}
+    result = export_result or {}
+    metadata = metadata or {}
+    model_files = list((artifacts.get('models') or {}).keys())
+    model_name = metadata.get('modelName') or metadata.get('model_name')
+    if not model_name and model_files:
+        model_name = re.sub(r'\.sql$', '', os.path.basename(model_files[0]), flags=re.IGNORECASE)
+    model_name = model_name or 'executive_dashboard'
+    project_name = metadata.get('projectName') or metadata.get('project_name') or 'qlik_migration_validation'
+    warnings = metadata.get('warnings') or metadata.get('validationIssues') or metadata.get('validation_issues') or []
+    quality = {
+        'sqlQualityScore': metadata.get('sqlQualityScore', metadata.get('sql_quality_score')),
+        'status': metadata.get('status'),
+        'warningsCount': metadata.get('warningsCount', metadata.get('warnings_count', len(warnings or []))),
+    }
+    quality = {key: value for key, value in quality.items() if value is not None}
+    files = list(result.get('files_written') or result.get('filesWritten') or [])
+    return {
+        'exportedAt': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        'projectName': project_name,
+        'modelName': model_name,
+        'artifactCounts': {
+            'models': len(artifacts.get('models') or {}),
+            'tests': len(artifacts.get('tests') or {}),
+            'analyses': len(artifacts.get('analyses') or {}),
+        },
+        'files': files,
+        'hasSchemaYml': bool(artifacts.get('schema_yml')),
+        'hasDbtProject': any(str(file_name).endswith('dbt_project.yml') for file_name in files),
+        'quality': quality,
+        'instructions': [
+            'Configure dbt profile or dbt Cloud connection',
+            'Run dbt compile',
+            'Run dbt run --select executive_dashboard',
+            'Run dbt test',
+            'Review analyses SQL outputs',
+        ],
+    }
+
+
+def _summary_list(items, empty_text='None'):
+    items = list(items or [])
+    if not items:
+        return f"- {empty_text}"
+    return '\n'.join(f"- {item}" for item in items)
+
+
+def generate_export_summary_report(
+    validation_artifacts: dict,
+    manifest: dict,
+    dry_run_result=None,
+    quality=None,
+) -> str:
+    """Generate a human-readable summary for a validation artifact export."""
+    artifacts = validation_artifacts or {}
+    manifest = manifest or {}
+    quality = quality or manifest.get('quality') or {}
+    dry_run_status = (dry_run_result or {}).get('status') if dry_run_result else 'not run'
+    models = sorted((artifacts.get('models') or {}).keys())
+    tests = sorted((artifacts.get('tests') or {}).keys())
+    analyses = sorted((artifacts.get('analyses') or {}).keys())
+    score = quality.get('score', quality.get('sqlQualityScore'))
+    passed = quality.get('passed') or []
+    warnings = quality.get('warnings') or []
+    failures = quality.get('failures') or []
+    if quality.get('warningsCount') is not None and not warnings:
+        warnings = [f"{quality.get('warningsCount')} warning(s) reported"]
+    lines = [
+        '# Qlik Migration Validation Package',
+        '',
+        '## Package Overview',
+        f"- Model name: {manifest.get('modelName', 'executive_dashboard')}",
+        f"- Exported timestamp: {manifest.get('exportedAt', 'unknown')}",
+        f"- Models: {(manifest.get('artifactCounts') or {}).get('models', len(models))}",
+        f"- Tests: {(manifest.get('artifactCounts') or {}).get('tests', len(tests))}",
+        f"- Analyses: {(manifest.get('artifactCounts') or {}).get('analyses', len(analyses))}",
+        f"- Dry-run status: {dry_run_status}",
+        '',
+        '## SQL Quality Summary',
+        f"- Score: {score if score is not None else 'not available'}",
+        f"- Status: {quality.get('status', 'not available')}",
+        '',
+        'Passed checks:',
+        _summary_list(passed),
+        '',
+        'Warnings:',
+        _summary_list(warnings),
+        '',
+        'Failures:',
+        _summary_list(failures),
+        '',
+        '## Validation Assets',
+        '',
+        'Model SQL files:',
+        _summary_list(models),
+        '',
+        'Singular dbt tests:',
+        _summary_list(tests),
+        '',
+        'Analyses SQL files:',
+        _summary_list(analyses),
+        '',
+        '## What This Package Validates',
+        '- Row count validation between source fact/expenses data and migrated output',
+        '- Null and key checks for required migrated fields',
+        '- Fact/expense concat structure through `facttable_with_expenses` validation',
+        '- Metric totals for sales, expense, budget, and AR fields when present',
+        '- Breakdown analyses by region, month, customer, sales rep, and product group',
+        '',
+        '## What Still Requires Execution',
+        '- Run `dbt compile` to validate dbt/Jinja compilation',
+        '- Run `dbt run` to materialize the generated model',
+        '- Run `dbt test` to execute singular validation tests',
+        '- Compare analysis outputs to Qlik baseline extracts',
+        '- Confirm warehouse raw source availability and source mappings',
+        '',
+        '## Recommended Commands',
+        '',
+        '```bash',
+        'dbt compile',
+        'dbt run --select executive_dashboard',
+        'dbt test',
+        'dbt compile --select analyses',
+        '```',
+        '',
+        '## Known Limitations',
+        '- Qlik associative behavior is not fully proven until execution comparison',
+        '- Date fields can remain ambiguous when source types differ from Qlik dual values',
+        '- Source type differences between QVD/Qlik and warehouse tables may affect parity',
+        '- Metric parity requires a real Qlik baseline for row counts, totals, and grouped outputs',
+    ]
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def export_validation_artifacts(validation_artifacts: dict, output_dir: str, include_project_scaffold: bool = True, metadata=None) -> dict:
+    """Write validation artifacts to a dbt-compatible folder under generated_artifacts."""
+    files_written = []
+    errors = []
+    try:
+        resolved_dir = _resolve_validation_output_dir(output_dir)
+    except Exception as exc:
+        return {
+            'output_dir': '',
+            'files_written': [],
+            'errors': [str(exc)],
+        }
+
+    artifacts = validation_artifacts or {}
+    os.makedirs(resolved_dir, exist_ok=True)
+    if include_project_scaffold:
+        for filename, content in generate_dbt_project_scaffold().items():
+            if filename == 'packages.yml' and not str(content or '').strip():
+                continue
+            _write_validation_artifact_file(resolved_dir, '', filename, content, files_written, errors)
+    for filename, content in (artifacts.get('models') or {}).items():
+        _write_validation_artifact_file(resolved_dir, 'models', filename, content, files_written, errors)
+    if 'schema_yml' in artifacts:
+        _write_validation_artifact_file(resolved_dir, 'models', 'schema.yml', artifacts.get('schema_yml'), files_written, errors)
+    for filename, content in (artifacts.get('tests') or {}).items():
+        _write_validation_artifact_file(resolved_dir, 'tests', filename, content, files_written, errors)
+    for filename, content in (artifacts.get('analyses') or {}).items():
+        _write_validation_artifact_file(resolved_dir, 'analyses', filename, content, files_written, errors)
+    export_result = {
+        'output_dir': resolved_dir,
+        'files_written': files_written,
+        'errors': errors,
+    }
+    provisional_manifest = generate_export_manifest(artifacts, export_result, metadata=metadata)
+    summary_report = generate_export_summary_report(
+        artifacts,
+        provisional_manifest,
+        dry_run_result=None,
+        quality=(metadata or {}).get('quality') if isinstance(metadata, dict) else None,
+    )
+    _write_validation_artifact_file(
+        resolved_dir,
+        '',
+        'summary_report.md',
+        summary_report,
+        files_written,
+        errors,
+    )
+    export_result['files_written'] = files_written
+    manifest = generate_export_manifest(artifacts, export_result, metadata=metadata)
+    _write_validation_artifact_file(
+        resolved_dir,
+        '',
+        'manifest.json',
+        json.dumps(manifest, indent=2, sort_keys=True),
+        files_written,
+        errors,
+    )
+    export_result['files_written'] = files_written
+    export_result['errors'] = errors
+    export_result['manifest_path'] = os.path.join(resolved_dir, 'manifest.json')
+    return export_result
+
+
+def zip_exported_artifacts(output_dir: str) -> dict:
+    """Create a zip archive for an exported validation artifact folder."""
+    root = _validation_artifacts_root()
+    resolved_dir = os.path.abspath(str(output_dir or '').strip())
+    if os.path.commonpath([root, resolved_dir]) != root:
+        raise ValueError('output_dir must be inside generated_artifacts')
+    if not os.path.isdir(resolved_dir):
+        raise ValueError('output_dir does not exist')
+
+    zip_file_name = _sanitize_artifact_filename(os.path.basename(resolved_dir) + '.zip', 'validation_artifacts.zip')
+    zip_path = os.path.abspath(os.path.join(root, zip_file_name))
+    if os.path.commonpath([root, zip_path]) != root:
+        raise ValueError('zip path must be inside generated_artifacts')
+
+    excluded_dirs = {'__pycache__', 'target', 'logs', 'dbt_packages'}
+    excluded_files = {'.DS_Store'}
+    files_zipped = []
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+        for current_dir, dirnames, filenames in os.walk(resolved_dir):
+            dirnames[:] = [dirname for dirname in dirnames if dirname not in excluded_dirs]
+            for filename in filenames:
+                if filename in excluded_files:
+                    continue
+                abs_path = os.path.abspath(os.path.join(current_dir, filename))
+                if os.path.commonpath([resolved_dir, abs_path]) != resolved_dir:
+                    continue
+                rel_path = os.path.relpath(abs_path, resolved_dir)
+                if rel_path.startswith('..') or os.path.isabs(rel_path):
+                    continue
+                archive.write(abs_path, rel_path)
+                files_zipped.append(rel_path)
+
+    return {
+        'zipPath': zip_path,
+        'zipFileName': zip_file_name,
+        'filesZipped': files_zipped,
+    }
+
+
+def _dry_run_check(checks: list, name: str, passed: bool, message: str):
+    checks.append({
+        'name': name,
+        'status': 'passed' if passed else 'failed',
+        'message': message,
+    })
+
+
+def _actual_exported_files(output_dir: str) -> list[str]:
+    files = []
+    for current_dir, dirnames, filenames in os.walk(output_dir):
+        dirnames[:] = [dirname for dirname in dirnames if dirname not in {'__pycache__'}]
+        for filename in filenames:
+            if filename == '.DS_Store':
+                continue
+            abs_path = os.path.abspath(os.path.join(current_dir, filename))
+            if os.path.commonpath([output_dir, abs_path]) != output_dir:
+                continue
+            files.append(os.path.relpath(abs_path, output_dir))
+    return sorted(files)
+
+
+def dry_run_validation_artifacts(output_dir: str) -> dict:
+    """Validate exported dbt artifact package structure and SQL text without running dbt."""
+    checks = []
+    errors = []
+    root = _validation_artifacts_root()
+    resolved_dir = os.path.abspath(str(output_dir or '').strip())
+    if os.path.commonpath([root, resolved_dir]) != root:
+        return {
+            'status': 'failed',
+            'checks': [{'name': 'output_dir_scope', 'status': 'failed', 'message': 'output_dir must be inside generated_artifacts'}],
+            'errors': ['output_dir must be inside generated_artifacts'],
+        }
+    if not os.path.isdir(resolved_dir):
+        return {
+            'status': 'failed',
+            'checks': [{'name': 'output_dir_exists', 'status': 'failed', 'message': 'output_dir does not exist'}],
+            'errors': ['output_dir does not exist'],
+        }
+
+    required_files = [
+        'dbt_project.yml',
+        'manifest.json',
+        'models/executive_dashboard.sql',
+        'models/schema.yml',
+    ]
+    for rel_path in required_files:
+        exists = os.path.isfile(os.path.join(resolved_dir, rel_path))
+        _dry_run_check(checks, f'required_file:{rel_path}', exists, f'{rel_path} exists' if exists else f'{rel_path} is missing')
+        if not exists:
+            errors.append(f'Missing required file: {rel_path}')
+
+    for rel_dir in ['models', 'tests', 'analyses']:
+        exists = os.path.isdir(os.path.join(resolved_dir, rel_dir))
+        _dry_run_check(checks, f'required_folder:{rel_dir}', exists, f'{rel_dir}/ exists' if exists else f'{rel_dir}/ is missing')
+        if not exists:
+            errors.append(f'Missing required folder: {rel_dir}/')
+
+    sql_files = [
+        rel_path for rel_path in _actual_exported_files(resolved_dir)
+        if rel_path.lower().endswith('.sql')
+    ]
+    for rel_path in sql_files:
+        abs_path = os.path.join(resolved_dir, rel_path)
+        try:
+            with open(abs_path, encoding='utf-8') as handle:
+                content = handle.read()
+        except Exception as exc:
+            content = ''
+            errors.append(f'Could not read {rel_path}: {exc}')
+        non_empty = bool(content.strip())
+        _dry_run_check(checks, f'sql_non_empty:{rel_path}', non_empty, f'{rel_path} is non-empty' if non_empty else f'{rel_path} is empty')
+        if not non_empty:
+            errors.append(f'Empty SQL file: {rel_path}')
+        no_placeholder = not re.search(r'<[^>\n]+>', content or '')
+        _dry_run_check(checks, f'no_placeholder:{rel_path}', no_placeholder, f'{rel_path} has no unresolved placeholders' if no_placeholder else f'{rel_path} contains unresolved placeholder text')
+        if not no_placeholder:
+            errors.append(f'Unresolved placeholder in {rel_path}')
+        no_join_corruption = 'AccountLEFT JOIN' not in (content or '')
+        _dry_run_check(checks, f'no_account_left_join:{rel_path}', no_join_corruption, f'{rel_path} has no AccountLEFT JOIN corruption' if no_join_corruption else f'{rel_path} contains AccountLEFT JOIN corruption')
+        if not no_join_corruption:
+            errors.append(f'AccountLEFT JOIN corruption in {rel_path}')
+        if rel_path.startswith('tests/'):
+            no_trailing_semicolon = not content.rstrip().endswith(';')
+            _dry_run_check(checks, f'test_no_trailing_semicolon:{rel_path}', no_trailing_semicolon, f'{rel_path} has no trailing semicolon' if no_trailing_semicolon else f'{rel_path} has trailing semicolon')
+            if not no_trailing_semicolon:
+                errors.append(f'Trailing semicolon in test SQL: {rel_path}')
+            no_select_star = not re.search(r'(?is)\bSELECT\s+\*', content or '')
+            _dry_run_check(checks, f'test_no_select_star:{rel_path}', no_select_star, f'{rel_path} has no SELECT *' if no_select_star else f'{rel_path} contains SELECT *')
+            if not no_select_star:
+                errors.append(f'SELECT * in test SQL: {rel_path}')
+
+    model_path = os.path.join(resolved_dir, 'models', 'executive_dashboard.sql')
+    model_sql = ''
+    if os.path.exists(model_path):
+        with open(model_path, encoding='utf-8') as handle:
+            model_sql = handle.read()
+    has_final_model = bool(re.search(r'(?is)\bfinal_model\b', model_sql))
+    _dry_run_check(checks, 'model_contains_final_model', has_final_model, 'model SQL contains final_model' if has_final_model else 'model SQL does not contain final_model')
+    if not has_final_model:
+        errors.append('Model SQL does not contain final_model')
+    has_final_select = bool(re.search(r'(?is)\bSELECT\s+\*\s+FROM\s+final_model\b', model_sql))
+    _dry_run_check(checks, 'model_final_select_from_final_model', has_final_select, 'model SQL ends with SELECT * FROM final_model' if has_final_select else 'model SQL does not contain final SELECT * FROM final_model')
+    if not has_final_select:
+        errors.append('Model SQL does not contain final SELECT * FROM final_model')
+
+    manifest_path = os.path.join(resolved_dir, 'manifest.json')
+    manifest = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, encoding='utf-8') as handle:
+                manifest = json.load(handle)
+        except Exception as exc:
+            errors.append(f'Could not parse manifest.json: {exc}')
+    actual_files = _actual_exported_files(resolved_dir)
+    manifest_files = sorted(set(manifest.get('files') or []))
+    actual_non_manifest_files = sorted(file_name for file_name in actual_files if file_name != 'manifest.json')
+    file_match = bool(manifest) and manifest_files == actual_non_manifest_files
+    _dry_run_check(checks, 'manifest_files_match_actual', file_match, 'manifest file list matches exported files' if file_match else 'manifest file list does not match exported files')
+    if not file_match:
+        errors.append('Manifest file list does not match actual exported files')
+
+    counts = manifest.get('artifactCounts') or {}
+    actual_counts = {
+        'models': len([file_name for file_name in actual_files if file_name.startswith('models/') and file_name.endswith('.sql')]),
+        'tests': len([file_name for file_name in actual_files if file_name.startswith('tests/') and file_name.endswith('.sql')]),
+        'analyses': len([file_name for file_name in actual_files if file_name.startswith('analyses/') and file_name.endswith('.sql')]),
+    }
+    counts_match = bool(manifest) and all(int(counts.get(key, -1)) == value for key, value in actual_counts.items())
+    _dry_run_check(checks, 'manifest_artifact_counts_match', counts_match, 'manifest artifact counts match files' if counts_match else 'manifest artifact counts do not match files')
+    if not counts_match:
+        errors.append('Manifest artifact counts do not match actual files')
+
+    return {
+        'status': 'failed' if errors else 'passed',
+        'checks': checks,
+        'errors': list(dict.fromkeys(errors)),
+    }
+
+
+def _pending_validation_check(check: dict, reason: str) -> dict:
+    result = dict(check or {})
+    result.setdefault('name', result.get('id') or result.get('type') or 'validation_check')
+    result.setdefault('id', result.get('name'))
+    result['status'] = 'pending'
+    result['result'] = None
+    result['expected'] = result.get('expected')
+    result['difference'] = None
+    result['message'] = reason
+    return result
+
+
+def _first_result_row(rows):
+    if rows is None:
+        return {}
+    if isinstance(rows, dict):
+        return rows
+    if isinstance(rows, (list, tuple)) and rows:
+        first = rows[0]
+        return first if isinstance(first, dict) else {}
+    return {}
+
+
+def _number_or_none(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _evaluate_executed_check(check: dict, rows, execution_context: dict) -> dict:
+    result = dict(check or {})
+    check_id = result.get('id') or result.get('name') or ''
+    check_type = result.get('type') or ''
+    result.setdefault('name', check_id)
+    result['result'] = rows
+    result.setdefault('expected', None)
+    result['difference'] = None
+
+    row = _first_result_row(rows)
+    if check_id == 'facttable_with_expenses_count':
+        variance = _number_or_none(row.get('variance'))
+        if variance is None:
+            fact = _number_or_none(row.get('facttable_count'))
+            expenses = _number_or_none(row.get('expenses_count'))
+            actual = _number_or_none(row.get('migrated_count') or row.get('actual'))
+            if fact is not None and expenses is not None and actual is not None:
+                variance = actual - (fact + expenses)
+        result['expected'] = 'migrated_count = facttable_count + expenses_count'
+        result['difference'] = variance
+        if variance is not None and abs(variance) < 1e-9:
+            result['status'] = 'passed'
+            result['message'] = 'Row count parity check passed.'
+        else:
+            result['status'] = 'failed'
+            result['message'] = 'Row count parity check failed.'
+        return result
+
+    expected_metrics = execution_context.get('expectedMetrics') or execution_context.get('expected_metrics') or {}
+    expected_breakdowns = execution_context.get('expectedBreakdowns') or execution_context.get('expected_breakdowns') or {}
+    if check_type == 'metric_total':
+        expected = expected_metrics.get(check_id) or expected_metrics.get(result.get('name'))
+        if expected is None:
+            result['status'] = 'pending'
+            result['message'] = 'Metric check executed, but no expected Qlik total is available.'
+            return result
+        actual = _number_or_none(row.get('migrated_total') or row.get('metric_total') or row.get('actual'))
+        expected_num = _number_or_none(expected)
+        diff = None if actual is None or expected_num is None else actual - expected_num
+        result['expected'] = expected
+        result['difference'] = diff
+        result['status'] = 'passed' if diff is not None and abs(diff) < 1e-9 else 'failed'
+        result['message'] = 'Metric total parity check passed.' if result['status'] == 'passed' else 'Metric total parity check failed.'
+        return result
+
+    if check_type == 'dimension_breakdown':
+        expected = expected_breakdowns.get(check_id) or expected_breakdowns.get(result.get('name'))
+        if expected is None:
+            result['status'] = 'pending'
+            result['message'] = 'Breakdown check executed, but no expected Qlik breakdown is available.'
+            return result
+        result['expected'] = expected
+        result['status'] = 'pending'
+        result['message'] = 'Breakdown comparison requires a configured comparison adapter.'
+        return result
+
+    result['status'] = 'passed'
+    result['message'] = 'Validation SQL executed.'
+    return result
+
+
+def execute_validation_report(validation_report, execution_context=None) -> dict:
+    """Execute generated validation checks when a dbt/warehouse runner is available."""
+    report = dict(validation_report or {})
+    checks = list(report.get('checks') or [])
+    context = execution_context or {}
+    enabled = bool(context.get('enabled')) if 'enabled' in context else False
+    reason = 'No execution context configured' if not execution_context else 'Validation execution disabled'
+
+    compile_check = dict(report.get('dbtCompile') or {})
+    compile_check.setdefault('name', 'dbt_compile')
+    compile_check.setdefault('type', 'dbt_compile')
+    compile_check.setdefault('sql', compile_check.get('command', ''))
+
+    if not enabled:
+        compile_check.update({
+            'status': 'pending',
+            'result': None,
+            'expected': 'dbt compile succeeds',
+            'difference': None,
+            'message': reason,
+        })
+        report['dbtCompile'] = compile_check
+        report['checks'] = [_pending_validation_check(check, reason) for check in checks]
+        report['status'] = 'pending'
+        return report
+
+    run_sql = context.get('run_sql') or context.get('execute_sql')
+    run_command = context.get('run_command') or context.get('run_dbt_command')
+    if not callable(run_sql):
+        reason = 'No execution context configured'
+        compile_check.update({
+            'status': 'pending',
+            'result': None,
+            'expected': 'dbt compile succeeds',
+            'difference': None,
+            'message': reason,
+        })
+        report['dbtCompile'] = compile_check
+        report['checks'] = [_pending_validation_check(check, reason) for check in checks]
+        report['status'] = 'pending'
+        return report
+
+    if callable(run_command):
+        try:
+            compile_result = run_command(compile_check.get('command') or '')
+            compile_check.update({
+                'status': 'passed',
+                'result': compile_result,
+                'expected': 'dbt compile succeeds',
+                'difference': None,
+                'message': 'dbt compile succeeded.',
+            })
+        except Exception as exc:
+            compile_check.update({
+                'status': 'failed',
+                'result': None,
+                'expected': 'dbt compile succeeds',
+                'difference': None,
+                'message': f'dbt compile failed: {exc}',
+            })
+    else:
+        compile_check.update({
+            'status': 'pending',
+            'result': None,
+            'expected': 'dbt compile succeeds',
+            'difference': None,
+            'message': 'No dbt compile runner configured.',
+        })
+
+    executed_checks = []
+    for check in checks:
+        try:
+            rows = run_sql(check.get('sql') or '')
+            executed_checks.append(_evaluate_executed_check(check, rows, context))
+        except Exception as exc:
+            failed = dict(check or {})
+            failed.setdefault('name', failed.get('id') or failed.get('type') or 'validation_check')
+            failed.setdefault('id', failed.get('name'))
+            failed.update({
+                'status': 'error',
+                'result': None,
+                'expected': failed.get('expected'),
+                'difference': None,
+                'message': f'Validation SQL execution failed: {exc}',
+            })
+            executed_checks.append(failed)
+
+    report['dbtCompile'] = compile_check
+    report['checks'] = executed_checks
+    statuses = [compile_check.get('status')] + [check.get('status') for check in executed_checks]
+    if any(status in {'failed', 'error'} for status in statuses):
+        report['status'] = 'failed'
+    elif all(status == 'passed' for status in statuses):
+        report['status'] = 'passed'
+    else:
+        report['status'] = 'pending'
+    return report
+
+
+def enforce_global_yyyymm_dateadd_coercion(sql_text: str) -> str:
+    """
+    Replace DATEADD(month, N, YYYYMM) or DATEADD(month, N, table.YYYYMM)
+    with DATEADD(month, N, TO_DATE(YYYYMM::varchar, 'YYYYMM')).
+    """
+    sql = sql_text or ''
+    pattern = re.compile(
+        r"""
+        DATEADD\s*\(\s*month\s*,\s*
+        (?P<n>-?\d+)\s*,\s*
+        (?P<expr>(?:[A-Za-z_][A-Za-z0-9_]*\.)?YYYYMM|(?:[A-Za-z_][A-Za-z0-9_]*\.)?yyyymm)
+        \s*\)
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    def repl(match):
+        n = match.group('n')
+        expr = match.group('expr')
+        if expr.lower() == 'yyyymm':
+            expr = 'YYYYMM'
+        return f"DATEADD(month, {n}, TO_DATE({expr}::varchar, 'YYYYMM'))"
+
+    return pattern.sub(repl, sql)
 
 
 def _validate_join_key_name_compatibility(sql_text: str):
@@ -1831,11 +4607,22 @@ def _validate_join_key_name_compatibility(sql_text: str):
             )
     return issues
 
-def _union_branch_column_counts(cte_body: str):
-    branches = re.split(r'\bUNION\s+ALL\b', cte_body or '', flags=re.IGNORECASE)
+def _union_branch_column_counts(cte_body: str, lineage_map=None):
+    branches = split_top_level_union_all(cte_body or '')
     if len(branches) <= 1:
         return []
-    return [len(_select_output_columns(branch)) for branch in branches]
+    return [count_select_columns_for_branch(branch, lineage_map=lineage_map) for branch in branches]
+
+
+def _union_branch_parser_integrity_issues(cte_name: str, cte_body: str) -> list[str]:
+    branches = split_top_level_union_all(cte_body or '')
+    if len(branches) <= 1:
+        return []
+    issues = []
+    for idx, branch in enumerate(branches, start=1):
+        for issue in _projection_parser_integrity_issues(branch):
+            issues.append(f'{issue} CTE {cte_name} branch {idx}.')
+    return issues
 
 
 def _strip_sql_comments_and_strings(sql_text: str):
@@ -1844,7 +4631,6 @@ def _strip_sql_comments_and_strings(sql_text: str):
     sql = re.sub(r'/\*[\s\S]*?\*/', ' ', sql)
     sql = re.sub(r'--[^\n\r]*', ' ', sql)
     sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
-    sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
     return sql
 
 
@@ -1855,6 +4641,10 @@ def validate_candidate_integrity(sql_text: str, plan=None):
     executable_sql = _strip_sql_comments_and_strings(sql)
     if not sql.strip():
         return ['EMPTY_SQL: generated SQL is empty.']
+    if plan and len(plan) >= 5 and len(sql) < 1000:
+        issues.append(
+            f'LOW_COVERAGE_SQL: Generated SQL is too small for generation plan size {len(plan)}.'
+        )
 
     config_count = len(re.findall(r'\{\{\s*config\s*\(', executable_sql, flags=re.IGNORECASE))
     if config_count > 1:
@@ -1887,11 +4677,40 @@ def validate_candidate_integrity(sql_text: str, plan=None):
     if re.search(r'\bCAST\s*\(\s*DATEADD\s*\([^)]*\bAS\s+DATE\s*\)', executable_sql, flags=re.IGNORECASE | re.DOTALL):
         issues.append('INVALID_CAST_DATEADD_SYNTAX: DATEADD was placed inside malformed CAST(... AS DATE) syntax.')
 
+    lineage_map = _cte_columns_by_name(executable_sql, names=names)
     for name in names:
         body = _cte_body_for(executable_sql, name)
-        counts = _union_branch_column_counts(body)
-        if counts and len(set(counts)) > 1:
-            issues.append(f'UNION_COLUMN_COUNT_MISMATCH: CTE {name} has UNION ALL branch column counts {counts}.')
+        parser_issues = _union_branch_parser_integrity_issues(name, body)
+        issues.extend(parser_issues)
+        counts = _union_branch_column_counts(body, lineage_map=lineage_map)
+        has_star_branch = bool(re.search(r'\bSELECT\s+(?:\w+\.)?\*\s*(?:,|\bFROM\b)', body or '', re.IGNORECASE))
+        if parser_issues:
+            continue
+        if counts and (any(count is None for count in counts) or any(count < 0 for count in counts) or has_star_branch):
+            # Star branches are handled by UNION_SELECT_STAR_BRANCH and should not
+            # produce misleading branch count mismatches.
+            pass
+        elif counts and len(set(counts)) > 1:
+            snippets = []
+            for idx, branch in enumerate(split_top_level_union_all(body)[:3], start=1):
+                snippet = re.sub(r'\s+', ' ', branch.strip())[:120]
+                snippets.append(f'b{idx}={snippet}')
+            snippet_text = ' | '.join(snippets)
+            if '""' in snippet_text:
+                issues.append(
+                    f'INTERNAL_PARSER_ERROR_QUOTED_IDENTIFIER_LOSS: CTE {name} union parser lost quoted identifiers. '
+                    f'snippets: {snippet_text}'
+                )
+            else:
+                issues.append(
+                    f'UNION_COLUMN_COUNT_MISMATCH: CTE {name} has UNION ALL branch column counts {counts}. '
+                    f'snippets: {snippet_text}'
+                )
+        if re.search(r'SELECT\s+(?:\w+\.)?\*\s*,?[\s\S]*?\bUNION\s+ALL\b', body or '', re.IGNORECASE):
+            issues.append(
+                f'UNION_SELECT_STAR_BRANCH: CTE {name} uses SELECT * in a UNION ALL branch; '
+                'expand all UNION branches to explicit columns with aligned schema.'
+            )
 
     fact_expenses_body = (
         _cte_body_for(executable_sql, 'facttable_with_expenses')
@@ -1962,13 +4781,24 @@ def validate_candidate_integrity(sql_text: str, plan=None):
             )
 
     issues.extend(_validate_duplicate_aliases(executable_sql))
-    issues.extend(_validate_alias_column_references(executable_sql, names))
+    issues.extend(_validate_alias_column_references(executable_sql, names, plan=plan))
     issues.extend(_validate_join_key_name_compatibility(executable_sql))
+    if 'DYNAMIC_UNION_REBUILD_FAILED' in sql or (
+        has_fact_expenses_join_cte(executable_sql) and has_union_star_branch(executable_sql)
+    ):
+        issues.append(
+            'DYNAMIC_UNION_REBUILD_FAILED: Could not dynamically rebuild facttable_with_expenses union '
+            'from facttable and expenses CTE schemas.'
+        )
     has_expenses_join = bool(re.search(
         r'\bJOIN\s+(?:expenses|expenses_for_fact|int_expenses|expenses_aggregated|int_expenses_aggregated)\b',
         executable_sql,
         re.IGNORECASE,
     ))
+    if plan_has_expenses_concatenate(plan) and final_model_has_bad_expenses_join(sql):
+        issues.append(
+            'INVALID_EXPENSES_JOIN_WITH_CONCAT_PLAN: final_model joins expenses directly even though plan requires CONCATENATE/UNION semantics.'
+        )
     if has_expenses_join and not _has_expenses_account_join(executable_sql):
         issues.append(
             'INVALID_EXPENSES_JOIN_MONTHLY_ONLY: expenses join is missing Account equality; '
@@ -2023,7 +4853,7 @@ def detect_repair_regressions(previous_sql: str, candidate_sql: str):
     return regressions
 
 
-def validate_generated_sql(sql_text, plan=None, dialect='dbt'):
+def validate_generated_sql(sql_text, plan=None, dialect='dbt', qvs_script=''):
     """Lightweight sanity checks for generated output.
 
     For Power BI dialect the checks are M Query / DAX aware.
@@ -2120,7 +4950,11 @@ def validate_generated_sql(sql_text, plan=None, dialect='dbt'):
         if referenced_sources and content_sources and not (referenced_sources & content_sources):
             issues.append('Generated SQL does not reference any extracted source tables.')
 
-    return issues
+    issues.extend(validate_fact_expenses_union_semantics(content))
+    issues.extend(validate_explicit_concatenate_field_parity(content, plan, qvs_script=qvs_script))
+    issues.extend(validate_qlik_semantic_parity(content, plan))
+    issues.extend(validate_execution_safety(content))
+    return list(dict.fromkeys(issues))
 
 
 def needs_sql_repair(issues):
@@ -2134,6 +4968,7 @@ def validation_issue_category(issue):
 
     compile_markers = (
         'EMPTY_SQL',
+        'LOW_COVERAGE_SQL',
         'UNBALANCED_PARENS',
         'BARE_DDL',
         'SHELL_OPERATOR',
@@ -2145,6 +4980,7 @@ def validation_issue_category(issue):
         'DUPLICATE_MODEL_COPY',
         'DUPLICATE_CTE_NAME',
         'REPAIR_CTE_SUFFIX_LEAK',
+        'SQL_CLEANUP_CORRUPTION',
         'UNRESOLVED_QLIK_FUNCTION',
         'INVALID_CAST_DATEADD_SYNTAX',
         'WRONG_FINAL_SELECT_SOURCE',
@@ -2153,6 +4989,7 @@ def validation_issue_category(issue):
         'JOIN_KEY_NAME_MISMATCH',
         'COLUMN_OWNERSHIP_MISMATCH',
         'QUOTED_CASE_MISMATCH',
+        'CONCATENATE_SOURCE_ONLY_FIELD_LEAK',
         'INVALID_NULLABLE_OR_JOIN_PREDICATE',
         'INVALID_NULLABLE_ACCOUNT_JOIN_PREDICATE',
         'INVALID_EXPENSES_JOIN_MONTHLY_ONLY',
@@ -2177,9 +5014,15 @@ def validation_issue_category(issue):
         'UNUSED_ACCOUNT_MASTER',
         'UNUSED_ACCOUNT_GROUP_MASTER',
         'REPAIR_REGRESSION_',
+        'INVALID_FACT_EXPENSES_UNION',
+        'INVALID_EXPENSES_BRANCH_OWNERSHIP',
+        'INVALID_FACT_BRANCH_OWNERSHIP',
+        'LEFTOVER_EXPENSES_REJOIN',
+        'CONCATENATE_FIELD_PARITY_MISMATCH',
         'QLIK VARIABLE SYNTAX',
     )
     metadata_markers = (
+        'INTERNAL_PARSER_ERROR',
         'IR_AMBIGUITY',
         'ISLAND_TABLE',
         'SOURCE_TABLE_MISMATCH',
@@ -2188,6 +5031,14 @@ def validation_issue_category(issue):
         'UNRESOLVED_REF',
         'UNREACHABLE_CTE_CREATED_NOT_USED',
         'LIKELY_TYPO',
+        'SQL_CLEANUP_LEFTOVER_ALIAS_E',
+        'SAFE_UNION_OVERRIDE',
+        'SELECT_STAR_EXECUTION_RISK',
+        'MISSING_CALENDAR_ENRICHMENT',
+        'INCOMPLETE_PRODUCT_HIERARCHY',
+        'MISSING_AR_ENRICHMENT',
+        'MISSING_CUSTOMER_ENRICHMENT',
+        'MISSING_BUDGET_ENRICHMENT',
     )
 
     if any(marker in upper for marker in compile_markers):
@@ -2844,7 +5695,11 @@ def _apply_semantic_validation_loop(
 
         structured_output = parse_migration_response(ai_response)
         if structured_output.get('sql'):
-            structured_output['sql'] = finalize_generated_sql(structured_output['sql'])
+            structured_output['sql'] = finalize_generated_sql(
+                structured_output['sql'],
+                plan=plan,
+                qvs_script=qvs_script,
+            )
 
         # Reject stub/empty responses. Do not score deterministic fallback as AI.
         sql_candidate = (structured_output.get('sql') or '').strip()
@@ -2895,7 +5750,11 @@ def _apply_semantic_validation_loop(
                 )
                 repaired_structured = parse_migration_response(repaired_response)
                 if repaired_structured.get('sql'):
-                    repaired_structured['sql'] = finalize_generated_sql(repaired_structured['sql'])
+                    repaired_structured['sql'] = finalize_generated_sql(
+                        repaired_structured['sql'],
+                        plan=plan,
+                        qvs_script=qvs_script,
+                    )
                     regressions = detect_repair_regressions(structured_output.get('sql', ''), repaired_structured['sql'])
                     if regressions:
                         logger.warning("Repair candidate rejected due to regressions: %s", regressions)
@@ -3131,7 +5990,7 @@ def request_migration_one_shot(
             validation_issues=['AI_STUB_OUTPUT'],
         )
 
-    final_sql = finalize_generated_sql(final_sql)
+    final_sql = finalize_generated_sql(final_sql, plan=plan, qvs_script=qvs_script)
     validation_issues = _audit_generated_sql_against_plan(
         final_sql,
         plan=plan,
