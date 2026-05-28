@@ -82,16 +82,30 @@ function applyRegenerationResult(fileId, result) {
     return structured;
   }
 
+  const resolvedJobId =
+    result?.jobId ||
+    result?.job_id ||
+    result?.id ||
+    result?.result?.jobId ||
+    result?.result?.job_id ||
+    result?.regeneration?.jobId ||
+    result?.regeneration?.job_id ||
+    store.get().currentRegenerationJobId ||
+    null;
+
   store.setFileReviewState(fileId, {
     regeneratedSql: structured.sql || '',
     regeneratedText: structured.description || '',
     regeneration: structured,
     regenerationHistory: result.regenerationHistory || store.get().regenerationHistory || [],
     activeRightTab: structured.sql ? 'sql' : 'desc',
+    currentRegenerationJobId: resolvedJobId,
   });
+
   store.set({
     regeneration: structured,
     regenerationHistory: result.regenerationHistory || store.get().regenerationHistory || [],
+    currentRegenerationJobId: resolvedJobId,
   });
   return structured;
 }
@@ -274,6 +288,7 @@ async function waitForRegenerationJob(jobId) {
           const loopNeeded = Boolean(data?.loopNeeded);
           const oneShotQualityScore = Number(data?.oneShotQualityScore || 0);
           const blockingIssues = data?.blockingIssues || [];
+          const resolvedJobId = data?.jobId || data?.job_id || data?.id || jobId;
           console.log('SSE done final SQL chars', finalSql.length);
           if (finalSql.trim()) {
             sqlBuffer = finalSql;
@@ -301,6 +316,7 @@ async function waitForRegenerationJob(jobId) {
                   loopNeeded,
                   oneShotQualityScore,
                   blockingIssues,
+                  jobId: resolvedJobId,
                 },
               });
             }
@@ -315,6 +331,7 @@ async function waitForRegenerationJob(jobId) {
               loopNeeded,
               oneShotQualityScore,
               blockingIssues,
+              jobId: resolvedJobId,
             },
           });
         },
@@ -380,6 +397,16 @@ async function executeRegenerationFlow(triggerMigration, finalize = false) {
 
     let finalPayload = initial;
     if (initial.queued && initial.jobId) {
+      store.set({ currentRegenerationJobId: initial.jobId });
+
+      if (fileId) {
+        store.setFileReviewState(fileId, {
+          currentRegenerationJobId: initial.jobId,
+          validationExportResult: null,
+          validationExportError: '',
+        });
+      }
+
       finalPayload = await waitForRegenerationJob(initial.jobId);
     }
 
@@ -511,6 +538,17 @@ export function renderReviewPage(container, options = {}) {
   const activeRightTab = currentFileState.activeRightTab || 'sql';
   const rightEditMode = currentFileState.rightEditMode || false;
   const generationWarnings = currentFileState.regeneration?.warnings || state.regeneration?.warnings || [];
+  const currentJobId =
+    currentFileState.currentRegenerationJobId ||
+    state.currentRegenerationJobId ||
+    currentFileState.regeneration?.jobId ||
+    currentFileState.regeneration?.job_id ||
+    state.regeneration?.jobId ||
+    state.regeneration?.job_id ||
+    null;
+  const exportResult = currentFileState.validationExportResult || null;
+  const exportError = currentFileState.validationExportError || '';
+  const isExporting = Boolean(currentFileState.isExportingValidationZip);
   const fileHistory = getFileHistory(state, currentFileId);
   const sessionTotals = getSessionTotals(state);
 
@@ -643,9 +681,37 @@ export function renderReviewPage(container, options = {}) {
       </div>
 
       <!-- Footer -->
-      <div class="review-footer">
+      <div class="review-footer" style="align-items:center;gap:10px;flex-wrap:wrap">
         <button class="btn btn-secondary" id="back-to-upload">← Back to Upload</button>
         <div style="flex:1"></div>
+
+        <div id="validation-export-status" style="font-size:12px;color:var(--text-secondary);max-width:420px;text-align:right">
+          ${!currentJobId ? 'Generate SQL first before exporting validation ZIP.' : ''}
+          ${exportError ? `<div style="color:var(--danger,#dc2626);font-weight:700">Export failed: ${escapeHtml(exportError)}</div>` : ''}
+          ${exportResult ? `
+            <div style="line-height:1.5">
+              <strong>ZIP:</strong> ${escapeHtml(exportResult.zipFileName || 'created')}
+              · <strong>Dry run:</strong> ${escapeHtml(exportResult.dryRunResult?.status || 'not run')}
+              ${exportResult.zipFileName ? `
+                · <a
+                    href="/api/download-validation-artifacts/${encodeURIComponent(exportResult.zipFileName)}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style="color:var(--primary);font-weight:800"
+                  >Download</a>
+              ` : ''}
+            </div>
+          ` : ''}
+        </div>
+
+        <button
+          class="btn btn-secondary btn-lg"
+          id="export-validation-zip-btn"
+          ${!currentJobId || isExporting ? 'disabled' : ''}
+        >
+          ${isExporting ? 'Exporting...' : '📦 Export validation ZIP'}
+        </button>
+
         <button class="btn btn-success btn-lg" id="generate-btn">⚡ Finalize Migration →</button>
       </div>
     </div>
@@ -995,6 +1061,67 @@ function setupButtons() {
     }
   });
 
+  // Export validation ZIP button
+  document.getElementById('export-validation-zip-btn')?.addEventListener('click', async () => {
+    const state = store.get();
+    const fileId = state.currentFileId || state.fileId;
+    const fileState = store.getFileReviewState(fileId) || {};
+
+    const jobId =
+      fileState.currentRegenerationJobId ||
+      state.currentRegenerationJobId ||
+      fileState.regeneration?.jobId ||
+      fileState.regeneration?.job_id ||
+      state.regeneration?.jobId ||
+      state.regeneration?.job_id ||
+      null;
+
+    if (!jobId) {
+      store.setFileReviewState(fileId, {
+        validationExportError: 'No regeneration job ID found. Generate SQL first.',
+      });
+      rerenderReviewControls();
+      return;
+    }
+
+    try {
+      store.setFileReviewState(fileId, {
+        isExportingValidationZip: true,
+        validationExportError: '',
+      });
+      rerenderReviewControls();
+
+      const res = await fetch('/api/export-validation-artifacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jobId,
+          includeProjectScaffold: true,
+          zip: true,
+          dryRun: true,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.status === 'error') {
+        throw new Error(data.message || data.error || `Export failed with HTTP ${res.status}`);
+      }
+
+      store.setFileReviewState(fileId, {
+        isExportingValidationZip: false,
+        validationExportResult: data,
+        validationExportError: '',
+      });
+      rerenderReviewControls();
+    } catch (err) {
+      store.setFileReviewState(fileId, {
+        isExportingValidationZip: false,
+        validationExportError: err.message || String(err),
+      });
+      rerenderReviewControls();
+    }
+  });
   // Finalize button
   document.getElementById('generate-btn')?.addEventListener('click', async () => {
     const btn = document.getElementById('generate-btn');
