@@ -42,10 +42,12 @@ from backend.migration.sql_generation import (
     enrich_final_model_projection,
     execute_validation_report,
     export_validation_artifacts,
+    force_replace_explicit_facttable_concat_cte,
     generate_validation_artifacts,
     generate_dbt_project_scaffold,
     generate_export_manifest,
     generate_export_summary_report,
+    generate_sql_fingerprint,
     extract_output_alias,
     extract_projection_display_names,
     extract_select_projection_columns,
@@ -59,6 +61,7 @@ from backend.migration.sql_generation import (
     finalize_generated_sql,
     fact_expenses_cte_has_alias_star,
     expand_fact_expenses_alias_star,
+    deterministic_finalize_sql_structure,
     has_union_star_branch,
     ONE_SHOT_MAX_TOKENS,
     LOOP_MAX_TOKENS,
@@ -930,6 +933,60 @@ class SqlGenerationImprovementPatchTests(unittest.TestCase):
         self.assertNotIn('Account', union_body)
         self.assertNotIn('ExpenseActual', union_body)
         self.assertNotIn('ExpenseBudget', union_body)
+
+    def test_force_replace_explicit_concat_replaces_entire_cte_body(self):
+        plan = [
+            make_load('FactTable', ['MonthlyRegionKey', 'Region', 'CustKey', 'YYYYMM'], source='FactTable.qvd'),
+            make_load('Expenses', ['MonthlyRegionKey', 'Region', 'YYYYMM'], source='Expenses.qvd', is_concat=True, concat_target='FactTable'),
+        ]
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH facttable AS (SELECT MonthlyRegionKey, Region, CustKey, YYYYMM FROM src),\n"
+            "expenses AS (SELECT MonthlyRegionKey, Region, YYYYMM, Account, ExpenseActual, ExpenseBudget FROM src),\n"
+            "facttable_with_expenses AS (\n"
+            "  SELECT MonthlyRegionKey, Region, CustKey, YYYYMM, CAST(NULL AS VARCHAR) AS Account, CAST(NULL AS NUMBER) AS ExpenseActual FROM facttable\n"
+            "  WHERE 1 = 1\n"
+            "  UNION ALL\n"
+            "  SELECT MonthlyRegionKey, Region, CustKey, YYYYMM, Account, ExpenseActual FROM expenses\n"
+            "  WHERE Account IS NOT NULL\n"
+            "),\n"
+            "final_model AS (\n"
+            "  SELECT f.CustKey, cmap.CustKeyAR\n"
+            "  FROM facttable_with_expenses f\n"
+            "  LEFT JOIN customermap cmap ON f.CustKey = cmap.CustKey\n"
+            ")\n"
+            "SELECT * FROM final_model"
+        )
+        replaced, applied = force_replace_explicit_facttable_concat_cte(sql, plan=plan)
+        self.assertTrue(applied)
+        union_body = extract_cte_body(replaced, 'facttable_with_expenses')
+        self.assertNotIn('WHERE 1 = 1', union_body)
+        self.assertNotIn('WHERE Account IS NOT NULL', union_body)
+        self.assertNotIn('Account', union_body)
+        self.assertNotIn('ExpenseActual', union_body)
+        self.assertNotIn('ExpenseBudget', union_body)
+        self.assertEqual(
+            extract_cte_output_columns(replaced, 'facttable_with_expenses'),
+            extract_cte_output_columns(replaced, 'facttable'),
+        )
+
+    def test_force_replace_explicit_concat_missing_facttable_marks_failure(self):
+        plan = [
+            make_load('Expenses', ['MonthlyRegionKey', 'Region', 'YYYYMM'], source='Expenses.qvd', is_concat=True, concat_target='FactTable'),
+        ]
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH expenses AS (SELECT MonthlyRegionKey, Region, YYYYMM FROM src),\n"
+            "facttable_with_expenses AS (\n"
+            "  SELECT MonthlyRegionKey, Region, YYYYMM FROM expenses\n"
+            ")\n"
+            "SELECT * FROM facttable_with_expenses"
+        )
+        replaced, applied = force_replace_explicit_facttable_concat_cte(sql, plan=plan)
+        self.assertFalse(applied)
+        self.assertIn('DYNAMIC_UNION_REBUILD_FAILED', replaced)
+        issues = validate_generated_sql(replaced, plan=plan, dialect='dbt')
+        self.assertTrue(any('DYNAMIC_UNION_REBUILD_FAILED' in issue for issue in issues), issues)
 
     def test_explicit_concat_rebuild_uses_facttable_not_budget_or_empty_from(self):
         plan = [
@@ -2329,6 +2386,149 @@ class TestTypedNulls(unittest.TestCase):
         self.assertIn('oneShotQualityScore', result)
         self.assertIn('joinContractCoverage', result)
         self.assertIn('loopPolicy', result)
+
+    def test_skip_ai_repair_avoids_repair_and_loop_calls(self):
+        try:
+            import flask  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest('Flask is not installed in this test environment')
+        import backend.app as app_mod
+
+        one_shot_result = {
+            'status': 'complete',
+            'sql': '{{ config(materialized="table") }}\nSELECT 1 AS id',
+            'final_sql': '{{ config(materialized="table") }}\nSELECT 1 AS id',
+            'validation_issues': [],
+        }
+        with patch.dict(os.environ, {'SKIP_AI_REPAIR': 'true'}), \
+             patch.object(app_mod, 'request_migration_one_shot', return_value=one_shot_result) as one_shot, \
+             patch.object(app_mod, '_audit_generated_sql_against_plan', return_value=['ALIAS_COLUMN_NOT_FOUND: demo']), \
+             patch.object(app_mod, '_generic_one_shot_quality_issues', return_value=[]), \
+             patch.object(app_mod, '_one_shot_repair_once') as repair_once, \
+             patch.object(app_mod, 'request_migration_with_validation') as loop:
+            result = app_mod.migrate_qvs_to_dbt(
+                'FactTable:\nLOAD A FROM FactTable.qvd;',
+                dialect='dbt',
+                generation_mode='auto',
+            )
+        one_shot.assert_called_once()
+        repair_once.assert_not_called()
+        loop.assert_not_called()
+        self.assertTrue(result.get('skipAiRepair'))
+        self.assertFalse(result.get('repairAttempted'))
+        self.assertFalse(result.get('loopNeeded'))
+        self.assertEqual(result.get('selected_generation_mode'), 'one_shot')
+        self.assertEqual(result.get('status'), 'complete_with_validation_issues')
+
+    def test_regenerate_cache_hit_avoids_generation_submit_and_returns_metadata(self):
+        try:
+            import flask  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest('Flask is not installed in this test environment')
+        import backend.app as app_mod
+
+        cached_payload = {
+            'status': 'complete',
+            'sql': "{{ config(materialized='table') }}\nWITH final_model AS (SELECT 1 AS id)\nSELECT * FROM final_model",
+            'description': 'cached',
+            'warnings': [],
+        }
+        cached_row = {
+            'id': 'cached_job',
+            'status': 'complete',
+            'created_at': '2026-05-27T00:00:00',
+            'completed_at': '2026-05-27T00:00:01',
+            'prompt_version': 'test',
+            'model': 'test-model',
+        }
+        bundle = {
+            'latest': {'file_id': 'f1'},
+            'cached_plan': {
+                'plan': [make_load('FactTable', ['id'], source='FactTable.qvd')],
+                'planText': 'FactTable',
+                'hash': 'plan-hash',
+            },
+            'scripts_context': 'FactTable:\nLOAD id FROM FactTable.qvd;',
+        }
+        client = app_mod.app.test_client()
+        with patch.dict(os.environ, {'USE_CACHED_GENERATION': 'true', 'SKIP_AI_REPAIR': 'true'}), \
+             patch.object(app_mod, 'build_session_bundle', return_value=bundle), \
+             patch.object(app_mod, 'find_cached_generation_result', return_value=(cached_row, cached_payload)) as cache_lookup, \
+             patch.object(app_mod.REGENERATION_EXECUTOR, 'submit') as submit, \
+             patch.object(app_mod, 'load_regeneration_history', return_value=[]):
+            response = client.post('/api/regenerate', json={
+                'sessionId': 's1',
+                'triggerMigration': True,
+                'generationMode': 'auto',
+                'dialect': 'dbt',
+            })
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        payload = response.get_json()
+        cache_lookup.assert_called_once()
+        submit.assert_not_called()
+        self.assertFalse(payload.get('queued'))
+        self.assertEqual(payload.get('jobId'), 'cached_job')
+        self.assertTrue(payload.get('usedCachedGeneration'))
+        self.assertTrue(payload.get('skipAiRepair'))
+        self.assertTrue(payload.get('regeneration', {}).get('usedCachedGeneration'))
+        self.assertTrue(payload.get('regeneration', {}).get('skipAiRepair'))
+
+    def test_repeated_finalize_outputs_identical_sql(self):
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH facttable_with_expenses AS (SELECT CustKey, YYYYMM FROM src),\n"
+            "customermap AS (SELECT CustKey, CustKeyAR FROM src),\n"
+            "calendar AS (SELECT YYYYMM, \"Fiscal Quarter\" FROM src),\n"
+            "final_model AS (\n"
+            "  SELECT cal.\"Fiscal Quarter\", f.*, cmap.CustKeyAR, cmap.CustKeyAR AS cmap_custkeyar\n"
+            "  FROM facttable_with_expenses f\n"
+            "  LEFT JOIN calendar cal ON f.YYYYMM = cal.YYYYMM\n"
+            "  LEFT JOIN customermap cmap ON f.CustKey = cmap.CustKey\n"
+            ")\n"
+            "SELECT * FROM final_model"
+        )
+        first = finalize_generated_sql(sql)
+        second = finalize_generated_sql(first)
+        self.assertEqual(first, second)
+
+    def test_deterministic_final_model_removes_duplicates_and_sorts_enrichment(self):
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH final_model AS (\n"
+            "  SELECT cal.\"Fiscal Quarter\", f.*, cmap.CustKeyAR, cmap.CustKeyAR AS cmap_custkeyar, cust.\"Customer Number\"\n"
+            "  FROM facttable_with_expenses f\n"
+            "  LEFT JOIN calendar cal ON f.YYYYMM = cal.YYYYMM\n"
+            "  LEFT JOIN customermaster cust ON f.\"Address Number\" = cust.\"Address Number\"\n"
+            "  LEFT JOIN customermap cmap ON f.CustKey = cmap.CustKey\n"
+            ")\nSELECT * FROM final_model"
+        )
+        out = deterministic_finalize_sql_structure(sql)
+        body = extract_cte_body(out, 'final_model')
+        select_list = body.split('FROM facttable_with_expenses', 1)[0]
+        self.assertIn('f.*', select_list)
+        self.assertEqual(select_list.count('cmap.CustKeyAR'), 1)
+        self.assertLess(select_list.index('f.*'), select_list.index('cal."Fiscal Quarter"'))
+        self.assertLess(body.index('JOIN customermap'), body.index('JOIN customermaster'))
+        self.assertLess(body.index('JOIN customermaster'), body.index('JOIN calendar'))
+
+    def test_sql_fingerprint_stable_across_whitespace(self):
+        a = "SELECT  a , b  FROM x WHERE a = 1"
+        b = " select a,b from x where a=1 "
+        self.assertEqual(generate_sql_fingerprint(a), generate_sql_fingerprint(b))
+
+    def test_validation_artifact_generation_order_is_stable(self):
+        sql = (
+            "{{ config(materialized='table') }}\n"
+            "WITH final_model AS (SELECT b, a, MonthlyRegionKey FROM {{ source('raw', 'FactTable') }})\n"
+            "SELECT * FROM final_model"
+        )
+        report = build_migration_validation_report(sql, model_name='executive_dashboard')
+        first = generate_validation_artifacts(sql, report, model_name='executive_dashboard')
+        second = generate_validation_artifacts(sql, report, model_name='executive_dashboard')
+        self.assertEqual(list(first['tests'].keys()), sorted(first['tests'].keys()))
+        self.assertEqual(list(first['analyses'].keys()), sorted(first['analyses'].keys()))
+        self.assertEqual(first['schema_yml'], second['schema_yml'])
+        self.assertLess(first['schema_yml'].index('- name: a'), first['schema_yml'].index('- name: b'))
 
     def test_build_migration_validation_report_has_executive_dashboard_checks(self):
         sql = "{{ config(materialized='table') }}\nSELECT 1 AS id"

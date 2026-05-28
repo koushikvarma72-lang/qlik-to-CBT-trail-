@@ -266,12 +266,55 @@ async function waitForRegenerationJob(jobId) {
           sseConnected = true;
           if (sseTimeoutId) { clearTimeout(sseTimeoutId); sseTimeoutId = null; }
           document.getElementById('stream-status')?.remove();
+          const finalSql = data?.sql || data?.final_sql || '';
+          const finalDesc = data?.description || '';
+          const finalWarnings = data?.warnings || [];
+          const finalStatus = data?.status || 'complete';
+          const repairAttempted = Boolean(data?.repairAttempted);
+          const loopNeeded = Boolean(data?.loopNeeded);
+          const oneShotQualityScore = Number(data?.oneShotQualityScore || 0);
+          const blockingIssues = data?.blockingIssues || [];
+          console.log('SSE done final SQL chars', finalSql.length);
+          if (finalSql.trim()) {
+            sqlBuffer = finalSql;
+            if (streamTarget) {
+              streamTarget.setValue(finalSql);
+            } else {
+              const pre = document.getElementById('stream-preview');
+              if (pre) {
+                pre.textContent = finalSql;
+                pre.scrollTop = pre.scrollHeight;
+              }
+            }
+            const state = store.get();
+            const fileId = state.currentFileId || state.fileId;
+            if (fileId) {
+              store.setFileReviewState(fileId, {
+                regeneratedSql: finalSql,
+                regeneration: {
+                  ...(store.getFileReviewState(fileId)?.regeneration || {}),
+                  sql: finalSql,
+                  description: finalDesc || (store.getFileReviewState(fileId)?.regeneratedText || ''),
+                  warnings: finalWarnings,
+                  status: finalStatus,
+                  repairAttempted,
+                  loopNeeded,
+                  oneShotQualityScore,
+                  blockingIssues,
+                },
+              });
+            }
+          }
           resolve({
-            status: 'complete',
+            status: finalStatus,
             result: {
-              sql: data.sql,
-              description: data.description,
-              warnings: data.warnings || [],
+              sql: finalSql,
+              description: finalDesc,
+              warnings: finalWarnings,
+              repairAttempted,
+              loopNeeded,
+              oneShotQualityScore,
+              blockingIssues,
             },
           });
         },

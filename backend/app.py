@@ -39,6 +39,7 @@ from backend.migration.sql_generation import (
     dry_run_validation_artifacts,
     export_validation_artifacts,
     generate_validation_artifacts,
+    generate_sql_fingerprint,
     extract_sql_generation_plan,
     format_sql_generation_plan,
     hash_text,
@@ -184,6 +185,19 @@ COST_TRACKER = CostTracker()
 # Per-job SSE token queues — keyed by job_id, populated by run_streaming_migration
 _STREAM_QUEUES: dict = {}
 _STREAM_QUEUES_LOCK = threading.Lock()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    fallback = 'true' if default else 'false'
+    return os.environ.get(name, fallback).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _skip_ai_repair_enabled() -> bool:
+    return _env_flag('SKIP_AI_REPAIR', False)
+
+
+def _use_cached_generation_enabled() -> bool:
+    return _env_flag('USE_CACHED_GENERATION', False)
 
 
 def _get_or_create_stream_queue(job_id):
@@ -464,11 +478,16 @@ def _attach_migration_validation_report(result, plan=None, dialect='dbt'):
     """Attach generated dbt parity validation SQL without executing it."""
     if not isinstance(result, dict):
         return result
+    result.setdefault('usedCachedGeneration', False)
+    result.setdefault('skipAiRepair', _skip_ai_repair_enabled())
     if (dialect or '').lower() != 'dbt':
         return result
     sql_text = result.get('final_sql') or result.get('sql') or ''
     if not str(sql_text or '').strip():
         return result
+    fingerprint = generate_sql_fingerprint(sql_text)
+    result['sqlFingerprint'] = fingerprint
+    result['deterministicFinalization'] = True
     report = build_migration_validation_report(sql_text, plan=plan or [], dialect=dialect)
     report = execute_validation_report(
         report,
@@ -496,6 +515,9 @@ def _ensure_result_validation_payload(result, plan=None, dialect='dbt'):
     sql_text = result.get('final_sql') or result.get('sql') or ''
     if not str(sql_text or '').strip():
         return result
+    fingerprint = generate_sql_fingerprint(sql_text)
+    result['sqlFingerprint'] = fingerprint
+    result['deterministicFinalization'] = True
     report = result.get('validationReport') or result.get('validation_report')
     if not report:
         report = build_migration_validation_report(sql_text, plan=plan or [], dialect=dialect, model_name='executive_dashboard')
@@ -1442,9 +1464,13 @@ def _one_shot_repair_once(quick_result, issues, qvs_script, plan, plan_text, dia
 
 
 def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, current_desc=None, dialect='dbt', plan=None, plan_text=None, progress_callback=None, stream_callback=None, generation_mode='auto'):
+    skip_ai_repair = _skip_ai_repair_enabled()
+    logger.info("SKIP_AI_REPAIR enabled=%s", skip_ai_repair)
     generation_mode = (generation_mode or 'auto').strip().lower()
     if generation_mode not in {'auto', 'one_shot', 'loop'}:
         generation_mode = 'auto'
+    if skip_ai_repair and generation_mode == 'loop':
+        generation_mode = 'one_shot'
     provider_prompt_version = f"{PROMPT_VERSION}.{_selected_ai_provider()}"
     logger.info("Migration mode selected: %s", generation_mode)
     if progress_callback:
@@ -1618,6 +1644,21 @@ def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, curre
         )
         safe_union_override_applied = safe_union_override_applied or forced_safe_union_filter_applied
         quick_result['validation_issues'] = quick_issues
+        if skip_ai_repair:
+            logger.info("SKIP_AI_REPAIR enabled=True")
+            quick_result['status'] = 'complete_with_validation_issues' if quick_issues else 'complete'
+            quick_result['validation_issues'] = quick_issues
+            quick_result['warnings'] = list(dict.fromkeys((quick_result.get('warnings') or []) + quick_issues))
+            quick_result['blockingIssues'] = blocking_issues
+            quick_result['loopNeeded'] = False
+            quick_result['repairAttempted'] = False
+            quick_result['used_one_shot_repair'] = False
+            quick_result['selected_generation_mode'] = 'one_shot'
+            quick_result['one_shot_validation_status'] = 'skipped_ai_repair_with_warnings' if quick_issues else 'passed'
+            quick_result['reason_for_entering_loop'] = ''
+            quick_result['skipAiRepair'] = True
+            quick_result['usedCachedGeneration'] = False
+            return _attach_migration_validation_report(quick_result, plan=plan, dialect=dialect)
 
         # One targeted repair before the expensive Senior AI/ML loop.
         false_union_mismatch = safe_union_override_applied or _is_safe_false_union_mismatch(quick_sql, quick_issues)
@@ -2280,6 +2321,28 @@ def load_regeneration_history(session_id):
     return [serialize_regeneration_history_row(row) for row in rows]
 
 
+def find_cached_generation_result(session_id, input_hash):
+    if not session_id or not input_hash:
+        return None, None
+    db = get_db()
+    row = db.execute(
+        '''SELECT * FROM regeneration_history
+           WHERE session_id = ?
+             AND input_hash = ?
+             AND status IN ('complete', 'complete_with_validation_issues')
+           ORDER BY COALESCE(completed_at, created_at) DESC
+           LIMIT 1''',
+        (session_id, input_hash),
+    ).fetchone()
+    db.close()
+    if not row:
+        return None, None
+    payload = safe_json_loads(row['regeneration_json'], {})
+    if not isinstance(payload, dict) or not (payload.get('sql') or payload.get('final_sql')):
+        return None, None
+    return row, payload
+
+
 def build_regeneration_response_from_row(row):
     structured = serialize_regeneration_payload(row)
     if not structured:
@@ -2493,6 +2556,8 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                             'loopNeeded': bool(migration_result.get('loopNeeded', False)),
                             'oneShotQualityScore': migration_result.get('oneShotQualityScore', 0.0),
                             'blockingIssues': migration_result.get('blockingIssues', []),
+                            'usedCachedGeneration': bool(migration_result.get('usedCachedGeneration', False)),
+                            'skipAiRepair': bool(migration_result.get('skipAiRepair', _skip_ai_repair_enabled())),
                         }
                         regenerated_sql = ''
                         regenerated_text = chosen_desc
@@ -2519,6 +2584,8 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                             'loopNeeded': bool(migration_result.get('loopNeeded', False)),
                             'oneShotQualityScore': migration_result.get('oneShotQualityScore', 0.0),
                             'blockingIssues': migration_result.get('blockingIssues', []),
+                            'usedCachedGeneration': bool(migration_result.get('usedCachedGeneration', False)),
+                            'skipAiRepair': bool(migration_result.get('skipAiRepair', _skip_ai_repair_enabled())),
                         }
                         regenerated_sql = structured['sql'] or regenerated_sql or edited_sql
                         regenerated_text = structured['description'] or regenerated_text or edited_text
@@ -2695,6 +2762,8 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                 'result': structured,
                 'generationPlan': cached_plan['plan'],
                 'generationPlanText': cached_plan['planText'],
+                'inputHash': input_hash,
+                'usedCachedGeneration': bool(structured.get('usedCachedGeneration', False)),
             }
         logger.info("Regeneration job completed: job_id=%s status=%s", job_id, status)
 
@@ -2714,6 +2783,8 @@ def run_regeneration_job(job_id, session_id, file_id, edited_sql, edited_text, r
                     'loopNeeded': bool(structured.get('loopNeeded', False)),
                     'oneShotQualityScore': structured.get('oneShotQualityScore', 0.0),
                     'blockingIssues': structured.get('blockingIssues', []),
+                    'usedCachedGeneration': bool(structured.get('usedCachedGeneration', False)),
+                    'skipAiRepair': bool(structured.get('skipAiRepair', _skip_ai_repair_enabled())),
                 })
         except Exception:
             pass
@@ -3038,6 +3109,49 @@ def regenerate():
         'planHash': cached_plan['hash'],
     }
     input_hash = hash_text(json.dumps(input_payload, sort_keys=True))
+
+    if _use_cached_generation_enabled():
+        cached_row, cached_result = find_cached_generation_result(session_id, input_hash)
+        if cached_row is not None and cached_result is not None:
+            logger.info("CACHE_GENERATION_HIT job_id=%s", cached_row['id'])
+            cached_result = dict(cached_result)
+            cached_result['usedCachedGeneration'] = True
+            cached_result['skipAiRepair'] = _skip_ai_repair_enabled()
+            cached_result = _ensure_result_validation_payload(
+                cached_result,
+                plan=cached_plan.get('plan', []),
+                dialect=dialect,
+            )
+            with REGENERATION_LOCK:
+                REGENERATION_JOBS[cached_row['id']] = {
+                    'status': cached_row['status'],
+                    'sessionId': session_id,
+                    'createdAt': cached_row['created_at'],
+                    'updatedAt': cached_row['completed_at'] or cached_row['created_at'],
+                    'promptVersion': cached_row['prompt_version'] or prompt_version,
+                    'model': cached_row['model'] or _active_ai_model(),
+                    'progress_message': 'Complete (cached)',
+                    'last_heartbeat': time.time(),
+                    'result': cached_result,
+                    'generationPlan': cached_plan['plan'],
+                    'generationPlanText': cached_plan['planText'],
+                    'inputHash': input_hash,
+                    'usedCachedGeneration': True,
+                }
+            return jsonify({
+                'success': True,
+                'queued': False,
+                'jobId': cached_row['id'],
+                'promptVersion': cached_row['prompt_version'] or prompt_version,
+                'generationPlan': cached_plan['plan'],
+                'generationPlanText': cached_plan['planText'],
+                'regeneration': cached_result,
+                'selectedGenerationMode': cached_result.get('selectedGenerationMode') or generation_mode,
+                'usedCachedGeneration': True,
+                'skipAiRepair': _skip_ai_repair_enabled(),
+                'regenerationHistory': load_regeneration_history(session_id),
+            }), 200
+
     history_id = create_regeneration_history_entry(
         session_id,
         file_id,
@@ -3058,6 +3172,8 @@ def regenerate():
         'promptVersion': prompt_version,
         'model': _active_ai_model(),
         'status': 'queued' if trigger_migration else 'complete',
+        'usedCachedGeneration': False,
+        'skipAiRepair': _skip_ai_repair_enabled(),
     }
 
     if trigger_migration:
@@ -3087,6 +3203,8 @@ def regenerate():
                 'model': _active_ai_model(),
                 'progress_message': 'Queued...',
                 'last_heartbeat': time.time(),
+                'inputHash': input_hash,
+                'usedCachedGeneration': False,
             }
         REGENERATION_EXECUTOR.submit(
             run_regeneration_job,
@@ -3113,6 +3231,8 @@ def regenerate():
             'generationPlanText': cached_plan['planText'],
             'regeneration': structured,
             'selectedGenerationMode': generation_mode,
+            'usedCachedGeneration': False,
+            'skipAiRepair': _skip_ai_repair_enabled(),
             'regenerationHistory': load_regeneration_history(session_id),
         }), 202
 
@@ -3140,6 +3260,8 @@ def regenerate():
         'generationPlan': cached_plan['plan'],
         'generationPlanText': cached_plan['planText'],
         'selectedGenerationMode': generation_mode,
+        'usedCachedGeneration': False,
+        'skipAiRepair': _skip_ai_repair_enabled(),
         'regenerationHistory': load_regeneration_history(session_id),
     })
 

@@ -42,6 +42,21 @@ def hash_text(text):
     return hashlib.sha256((text or '').encode('utf-8')).hexdigest()
 
 
+def generate_sql_fingerprint(sql: str) -> str:
+    """Return a stable hash for semantically equivalent generated SQL formatting."""
+    text = str(sql or '')
+    text = re.sub(r'--.*?$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    text = re.sub(r'\s+', ' ', text).strip().lower()
+    text = re.sub(r'\s*,\s*', ',', text)
+    text = re.sub(r'\s*\(\s*', '(', text)
+    text = re.sub(r'\s*\)\s*', ')', text)
+    text = re.sub(r'\s*=\s*', '=', text)
+    text = re.sub(r'\s+\bas\b\s+', ' as ', text)
+    text = re.sub(r',\s*(from|where|group by|order by|having|qualify)\b', r' \1', text)
+    return hash_text(text)
+
+
 def prune_inline_loads(script_text):
     """
     Find huge inline data blocks in Qlik scripts and collapse them to keep the context size
@@ -839,6 +854,132 @@ def enrich_final_model_projection(sql_text: str) -> str:
         return sql
     rebuilt_body = 'SELECT\n    ' + ',\n    '.join(fields + additions) + '\n' + from_tail.strip()
     return _replace_cte_body(sql, target_cte, '\n' + rebuilt_body + '\n')
+
+
+_JOIN_RELATION_ORDER = {
+    'facttable': 0,
+    'fact_table': 0,
+    'facttable_with_expenses': 0,
+    'fact_table_with_expenses': 0,
+    'customermap': 10,
+    'customermaster': 11,
+    'customeraddressmaster': 12,
+    'channelmaster': 20,
+    'arsummary': 30,
+    'arsummary_1': 31,
+    'calendar': 40,
+    'historyflag': 41,
+    'itembranchmaster': 50,
+    'itemmaster': 51,
+    'productgroupmaster': 52,
+    'productsubgroupmaster': 53,
+    'producttypemaster': 54,
+    'budget': 60,
+    'accounts': 70,
+    'accountmaster': 71,
+    'accountgroupmaster': 72,
+}
+
+
+def _projection_sort_key(expr: str):
+    text = str(expr or '').strip()
+    if re.search(r'(?is)\b\w+\.\*$', text):
+        return (0, text.lower())
+    raw = re.sub(r'(?is)\s+\bAS\b\s+.*$', '', text).strip()
+    alias_match = re.match(r'(?is)^([A-Za-z_][A-Za-z0-9_]*)\.', raw)
+    alias = alias_match.group(1).lower() if alias_match else ''
+    return (1, f'{alias}.{_normalize_column_token(extract_output_alias(text) or raw)}')
+
+
+def _join_sort_key(join_sql: str):
+    match = re.search(
+        r'(?is)\bJOIN\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b',
+        join_sql or '',
+    )
+    relation = _normalize_cte_name(match.group(1)) if match else ''
+    alias = match.group(2).lower() if match else ''
+    return (_JOIN_RELATION_ORDER.get(relation, 90), relation, alias, re.sub(r'\s+', ' ', join_sql or '').lower())
+
+
+def _dedupe_projection_items(fields: list[str]) -> list[str]:
+    seen_outputs = set()
+    seen_raw_refs = set()
+    result = []
+    for field in fields or []:
+        item = str(field or '').strip().rstrip(',')
+        if not item:
+            continue
+        output = _normalize_column_token(extract_output_alias(item))
+        raw_key = _projection_raw_expr_key(item)
+        if raw_key in seen_raw_refs:
+            continue
+        if output and output in seen_outputs:
+            continue
+        seen_raw_refs.add(raw_key)
+        if output:
+            seen_outputs.add(output)
+        result.append(item)
+    return result
+
+
+def _split_from_tail_joins(from_tail: str):
+    tail = from_tail or ''
+    matches = list(re.finditer(r'(?is)\b(?:LEFT|RIGHT|FULL|INNER|CROSS)?\s*JOIN\b', tail))
+    if not matches:
+        return tail.strip(), [], ''
+    prefix = tail[:matches[0].start()].rstrip()
+    joins = []
+    stop_suffix = ''
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(tail)
+        chunk = tail[start:end].rstrip()
+        stop = re.search(r'(?is)\bWHERE\b|\bGROUP\s+BY\b|\bHAVING\b|\bQUALIFY\b|\bORDER\s+BY\b', chunk)
+        if stop:
+            joins.append(chunk[:stop.start()].rstrip())
+            stop_suffix = chunk[stop.start():].strip()
+            break
+        joins.append(chunk)
+    if not stop_suffix and matches:
+        last_end = matches[-1].end()
+        # suffix is normally included in final join chunk; leave empty unless a clause split above found it.
+    return prefix, [join for join in joins if join.strip()], stop_suffix
+
+
+def deterministic_finalize_sql_structure(sql_text: str, plan=None) -> str:
+    """Stabilize final_model projection and join ordering without changing SQL semantics."""
+    sql = sql_text or ''
+    target_cte = 'final_model' if _cte_body_for(sql, 'final_model') else ('final_mart' if _cte_body_for(sql, 'final_mart') else '')
+    if not target_cte:
+        return sql
+    body = _cte_body_for(sql, target_cte)
+    select_list, from_tail = _extract_top_level_select_and_from(body)
+    if not select_list or not from_tail:
+        return sql
+
+    fields = split_top_level_csv(re.sub(r'^\s*DISTINCT\b\s*', '', select_list, flags=re.IGNORECASE))
+    fields = _dedupe_projection_items(fields)
+    fact_fields = [field for field in fields if _projection_sort_key(field)[0] == 0]
+    enrichment_fields = sorted(
+        [field for field in fields if _projection_sort_key(field)[0] != 0],
+        key=_projection_sort_key,
+    )
+    ordered_fields = fact_fields + enrichment_fields
+
+    from_prefix, joins, suffix = _split_from_tail_joins(from_tail)
+    ordered_joins = sorted(_dedupe_projection_items(joins), key=_join_sort_key)
+    tail_parts = [from_prefix.strip()]
+    tail_parts.extend(join.strip() for join in ordered_joins)
+    if suffix:
+        tail_parts.append(suffix.strip())
+    rebuilt_body = (
+        '\nSELECT\n    '
+        + ',\n    '.join(ordered_fields)
+        + '\n'
+        + '\n'.join(part for part in tail_parts if part)
+        + '\n'
+    )
+    return _replace_cte_body(sql, target_cte, rebuilt_body)
 
 
 def _audit_generated_sql_against_plan(sql_text, plan=None, qvs_script='', dialect='dbt'):
@@ -2649,6 +2790,77 @@ def enforce_explicit_concat_target_schema(sql_text: str, plan=None, qvs_script: 
     return enforced
 
 
+def force_replace_explicit_facttable_concat_cte(sql, plan=None, qvs_script=None) -> tuple[str, bool]:
+    """Hard-replace facttable_with_expenses for explicit Qlik CONCATENATE (FactTable)."""
+    text = sql or ''
+    detected = _has_explicit_facttable_concatenate(plan, qvs_script=qvs_script or '')
+    logger.info("FORCE_EXPLICIT_CONCAT_REPLACE_ENTER detected=%s", detected)
+    if not detected:
+        return text, False
+
+    union_cte = _fact_expenses_cte_name(text)
+    if not union_cte:
+        logger.info("FORCE_EXPLICIT_CONCAT_REPLACE_DONE applied=%s fact_cols=%s leaked_cols=%s", False, 0, [])
+        return text, False
+
+    fact_cte = 'facttable' if _cte_body_for(text, 'facttable') else ('fact_table' if _cte_body_for(text, 'fact_table') else '')
+    expenses_cte = 'expenses' if _cte_body_for(text, 'expenses') else ''
+    if not fact_cte or not expenses_cte:
+        logger.info("FORCE_EXPLICIT_CONCAT_REPLACE_DONE applied=%s fact_cols=%s leaked_cols=%s", False, 0, [])
+        return _mark_dynamic_union_rebuild_failed(text) + '-- DYNAMIC_UNION_REBUILD_FAILED: explicit concat replacement failed\n', False
+
+    lineage_map = _cte_columns_by_name(text)
+    fact_cols_map = extract_cte_output_column_map(text, fact_cte, lineage_map=lineage_map)
+    expense_cols_map = extract_cte_output_column_map(text, expenses_cte, lineage_map=lineage_map)
+    if not fact_cols_map or not expense_cols_map:
+        logger.info("FORCE_EXPLICIT_CONCAT_REPLACE_DONE applied=%s fact_cols=%s leaked_cols=%s", False, len(fact_cols_map), [])
+        return _mark_dynamic_union_rebuild_failed(text) + '-- DYNAMIC_UNION_REBUILD_FAILED: explicit concat replacement failed\n', False
+
+    explicit_fields = _explicit_concatenate_fields_for_target(plan, 'FactTable', expenses_cte)
+    if explicit_fields is None:
+        explicit_fields = _explicit_facttable_concat_fields_from_qvs(qvs_script or '')
+    explicit_fields = explicit_fields or set()
+
+    fact_rendered = [_sql_column_ref(raw) for _norm, raw in fact_cols_map.items()]
+    expense_rendered = []
+    for norm, raw in fact_cols_map.items():
+        expense_raw = expense_cols_map.get(norm) if norm in explicit_fields else None
+        if expense_raw:
+            expense_rendered.append(_sql_column_ref(expense_raw))
+        else:
+            expense_rendered.append(f'CAST(NULL AS {_infer_sql_type_from_name(raw)}) AS {_sql_column_ref(raw)}')
+
+    new_body = (
+        '\nSELECT\n    '
+        + ',\n    '.join(fact_rendered)
+        + f'\nFROM {fact_cte}\n\nUNION ALL\n\nSELECT\n    '
+        + ',\n    '.join(expense_rendered)
+        + f'\nFROM {expenses_cte}\n'
+    )
+    replaced = _replace_cte_body(text, union_cte, new_body)
+
+    fact_cols = extract_cte_output_columns(replaced, fact_cte)
+    union_cols = extract_cte_output_columns(replaced, union_cte)
+    leaked_cols = [
+        raw for norm, raw in expense_cols_map.items()
+        if norm in {_normalize_column_token(col) for col in union_cols}
+        and norm not in {_normalize_column_token(col) for col in fact_cols}
+    ]
+    applied = fact_cols == union_cols and not leaked_cols
+    logger.info(
+        "FORCE_EXPLICIT_CONCAT_REPLACE_DONE applied=%s fact_cols=%s leaked_cols=%s",
+        applied,
+        len(fact_cols),
+        leaked_cols,
+    )
+    if not applied:
+        return _mark_dynamic_union_rebuild_failed(replaced) + '-- DYNAMIC_UNION_REBUILD_FAILED: explicit concat replacement failed\n', False
+    marker = '-- EXPLICIT_CONCAT_SCHEMA_ENFORCED'
+    if marker not in replaced:
+        replaced = replaced.rstrip() + '\n' + marker + '\n'
+    return replaced, True
+
+
 def _build_dynamic_fact_expenses_union_body(sql: str, fact_cte: str, expenses_cte: str, plan=None) -> str:
     if not fact_cte or not expenses_cte:
         return ''
@@ -2930,13 +3142,14 @@ def finalize_generated_sql(sql_text: str, plan=None, qvs_script='') -> str:
         sql = compose_final_model_from_contract(sql, join_contract)
     sql = enforce_final_model_wrapper(sql)
     sql = enrich_final_model_projection(sql)
+    sql = deterministic_finalize_sql_structure(sql, plan=plan)
     sql = enforce_complete_final_select(sql)
     before_last = sql
-    sql = enforce_explicit_concat_target_schema(sql, plan=plan, qvs_script=qvs_script)
+    sql, forced_explicit_concat = force_replace_explicit_facttable_concat_cte(sql, plan=plan, qvs_script=qvs_script)
     union_body = _cte_body_for(sql, _fact_expenses_cte_name(sql)) if _fact_expenses_cte_name(sql) else ''
     logger.info(
         "FINALIZE_LAST_STEP_EXPLICIT_CONCAT applied=%s has_account=%s has_expenseactual=%s has_expensebudget=%s",
-        before_last != sql or '-- EXPLICIT_CONCAT_SCHEMA_ENFORCED' in sql,
+        forced_explicit_concat or before_last != sql or '-- EXPLICIT_CONCAT_SCHEMA_ENFORCED' in sql,
         bool(re.search(r'(?i)\baccount\b', union_body)),
         bool(re.search(r'(?i)\bexpenseactual\b', union_body)),
         bool(re.search(r'(?i)\bexpensebudget\b', union_body)),
@@ -3768,7 +3981,7 @@ def _source_names_for_artifacts(sql: str) -> list[str]:
 
 
 def _schema_yml_for_validation_artifacts(sql: str, model_name: str, columns) -> str:
-    sources = _source_names_for_artifacts(sql)
+    sources = sorted(_source_names_for_artifacts(sql), key=lambda value: str(value).lower())
     lines = ["version: 2", "", "sources:", "  - name: raw", "    tables:"]
     if sources:
         for source in sources:
@@ -3777,7 +3990,7 @@ def _schema_yml_for_validation_artifacts(sql: str, model_name: str, columns) -> 
         lines.append("      - name: source_table")
     lines.extend(["", "models:", f"  - name: {model_name}", "    columns:"])
     if columns:
-        for column in columns:
+        for column in sorted(columns, key=lambda value: _normalize_column_token(value)):
             col_name = str(column or '').strip().strip('"')
             if not col_name:
                 continue
@@ -3804,7 +4017,7 @@ def generate_validation_artifacts(sql: str, validation_report: dict, model_name=
     """Generate dbt model, singular tests, analyses, and schema YAML for SQL validation."""
     safe_model = re.sub(r'[^A-Za-z0-9_]+', '_', str(model_name or 'executive_dashboard')).strip('_') or 'executive_dashboard'
     sql_text = _strip_trailing_semicolon(sql or '')
-    columns = _artifact_column_names(sql_text)
+    columns = sorted(_artifact_column_names(sql_text), key=lambda value: _normalize_column_token(value))
     lower_sql = (sql_text or '').lower()
 
     tests = {}
@@ -3892,6 +4105,8 @@ def generate_validation_artifacts(sql: str, validation_report: dict, model_name=
 
     tests = {name: _strip_trailing_semicolon(sanitize_test_sql_projection(value)) for name, value in tests.items()}
     analyses = {name: _strip_trailing_semicolon(value) for name, value in analyses.items()}
+    tests = dict(sorted(tests.items()))
+    analyses = dict(sorted(analyses.items()))
     return {
         'models': {
             f'{safe_model}.sql': sql_text,
