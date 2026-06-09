@@ -1178,6 +1178,12 @@ async function loadQvdSessionData(sessionId, container) {
       sessionType: 'qvd',
       uploadMode: 'qvd',
       qvdInspection: data.qvdInspection || data,
+      qvdApprovedMapping: data.qvdApprovedMapping || null,
+      qvdDdlGeneration: data.qvdDdlGeneration || null,
+      qvdParquetConversions: data.qvdParquetConversions || {},
+      qvdParquetValidations: data.qvdParquetValidations || {},
+      qvdDatabricksLoadScripts: data.qvdDatabricksLoadScripts || {},
+      qvdMigrationPackages: data.qvdMigrationPackages || {},
     });
     store.navigate('output');
   } catch (err) {

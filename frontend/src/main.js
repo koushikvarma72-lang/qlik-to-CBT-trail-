@@ -26,7 +26,7 @@ function renderApp() {
   const qvdHasLoadScripts = Object.values(state.qvdDatabricksLoadScripts || {}).some(result => result?.generated);
   const qvdHasPackage = Object.values(state.qvdMigrationPackages || {}).some(result => result?.generated);
   const canReview = isQvdMode ? qvdHasDdl : !!state.filename;
-  const canOutput = isQvdMode ? qvdHasLoadScripts : !!state.regeneratedSql;
+  const canOutput = isQvdMode ? qvdHasDdl : !!state.regeneratedSql;
   const activeName = isQvdMode
     ? `${state.qvdInspection?.uploaded_files?.length || 0} QVD file${(state.qvdInspection?.uploaded_files?.length || 0) === 1 ? '' : 's'}`
     : state.filename;
@@ -216,6 +216,12 @@ function restoreQvdSession(payload, sessionId) {
     sessionType: 'qvd',
     uploadMode: 'qvd',
     qvdInspection: inspection,
+    qvdApprovedMapping: payload.qvdApprovedMapping || null,
+    qvdDdlGeneration: payload.qvdDdlGeneration || null,
+    qvdParquetConversions: payload.qvdParquetConversions || {},
+    qvdParquetValidations: payload.qvdParquetValidations || {},
+    qvdDatabricksLoadScripts: payload.qvdDatabricksLoadScripts || {},
+    qvdMigrationPackages: payload.qvdMigrationPackages || {},
   });
 }
 

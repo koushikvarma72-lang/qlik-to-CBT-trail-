@@ -2,6 +2,7 @@
  * QVF Decoder — Page 3: Regenerated Output
  */
 import { store } from '../store.js';
+import { apiDownloadUrl } from '../api.js';
 import { highlightSQL } from '../components/editor.js';
 import {
   renderQvdDatabricksLoadScripts,
@@ -12,6 +13,66 @@ import { renderQvdStatusChecklist } from '../components/qvdStatusChecklist.js';
 import { escapeHtml, markdownToHtml } from '../utils.js';
 
 let activeQvdOutputSection = 'overview';
+
+function qvdOutputCounts(state) {
+  const loadScriptsCount = Object.values(state.qvdDatabricksLoadScripts || {}).filter(result => result?.generated).length;
+  const packagesCount = Object.values(state.qvdMigrationPackages || {}).filter(result => result?.generated).length;
+  return { loadScriptsCount, packagesCount };
+}
+
+function renderQvdOutputActions(fileName, state) {
+  const loadResult = state.qvdDatabricksLoadScripts?.[fileName];
+  const packageResult = state.qvdMigrationPackages?.[fileName];
+  const loadLoading = state.qvdDatabricksLoadLoadingByFile?.[fileName];
+  const packageLoading = state.qvdMigrationPackageLoadingByFile?.[fileName];
+  const mappingApproved = !!(state.qvdApprovedMapping?.saved || state.qvdApprovedMapping?.approved_mapping_csv || state.qvdApprovedMapping?.mapping_rows?.length);
+  const ddlGenerated = !!state.qvdDdlGeneration?.generated;
+  const canGenerateLoad = mappingApproved && ddlGenerated && !loadLoading;
+  const packageDownloadUrl = packageResult?.download_url || packageResult?.migration_package?.download_url || `/api/qvd/download-migration-package/${encodeURIComponent(state.qvdInspection?.session_id || state.sessionId || '')}`;
+
+  return `
+    <div class="qvd-output-actions">
+      <button class="btn btn-primary qvd-preview-btn" data-qvd-load-scripts-file="${escapeHtml(fileName)}" ${canGenerateLoad ? '' : 'disabled'}>
+        ${loadLoading ? 'Generating...' : loadResult?.generated ? 'Regenerate Databricks Load Script' : 'Generate Databricks Load Script'}
+      </button>
+      <button class="btn btn-primary qvd-preview-btn" data-qvd-package-file="${escapeHtml(fileName)}" ${(packageLoading || !loadResult?.generated) ? 'disabled' : ''}>
+        ${packageLoading ? 'Packaging...' : packageResult?.generated ? 'Regenerate Migration Package' : 'Generate Migration Package'}
+      </button>
+      <a class="btn btn-secondary qvd-preview-btn ${packageResult?.generated ? '' : 'disabled'}" href="${packageResult?.generated ? apiDownloadUrl(packageDownloadUrl) : '#'}">
+        Download Migration Package
+      </a>
+      <button class="btn btn-success qvd-preview-btn qvd-output-deploy-btn" data-qvd-output-deploy-file="${escapeHtml(fileName)}" ${packageResult?.generated ? '' : 'disabled'}>
+        Continue to Databricks Deployment
+      </button>
+    </div>
+  `;
+}
+
+function renderQvdOutputTableCard(table, state) {
+  const summary = table.summary || {};
+  const fileName = summary.file_name || '';
+  const loadGenerated = !!state.qvdDatabricksLoadScripts?.[fileName]?.generated;
+  const packageGenerated = !!state.qvdMigrationPackages?.[fileName]?.generated;
+  return `
+    <section class="qvd-output-table-card">
+      <div class="qvd-output-table-card-header">
+        <div>
+          <h3>${escapeHtml(summary.table_name || fileName || 'QVD Table')}</h3>
+          <div>${escapeHtml(fileName)}</div>
+        </div>
+        <span class="badge ${packageGenerated ? 'badge-success' : 'badge-info'}">
+          ${packageGenerated ? 'Package ready' : 'Ready to package'}
+        </span>
+      </div>
+      <div class="qvd-output-debug">
+        qvdOutputActionsVisible=true, fileName=${escapeHtml(fileName)}, loadGenerated=${loadGenerated}, packageGenerated=${packageGenerated}
+      </div>
+      ${renderQvdOutputActions(fileName, state)}
+      ${renderQvdDatabricksLoadScripts(fileName, state)}
+      ${renderQvdMigrationPackage(fileName, state)}
+    </section>
+  `;
+}
 
 export function renderOutputPage(container) {
   const state = store.get();
@@ -112,6 +173,7 @@ export function renderOutputPage(container) {
 
 function renderQvdOutputPage(container, state) {
   const tables = state.qvdInspection?.tables || [];
+  const { loadScriptsCount, packagesCount } = qvdOutputCounts(state);
   if (activeQvdOutputSection !== 'overview' && !tables.some(table => (table.summary?.file_name || '') === activeQvdOutputSection)) {
     activeQvdOutputSection = 'overview';
   }
@@ -126,10 +188,14 @@ function renderQvdOutputPage(container, state) {
             <div class="inspect-subtitle">Review generated Databricks load scripts and create the downloadable migration package.</div>
           </div>
           <div class="inspect-metrics">
-            <div class="inspect-metric"><span>Load Scripts</span><strong>${Object.values(state.qvdDatabricksLoadScripts || {}).filter(result => result?.generated).length}</strong></div>
-            <div class="inspect-metric"><span>Packages</span><strong>${Object.values(state.qvdMigrationPackages || {}).filter(result => result?.generated).length}</strong></div>
+            <div class="inspect-metric"><span>Load Scripts</span><strong>${loadScriptsCount}</strong></div>
+            <div class="inspect-metric"><span>Packages</span><strong>${packagesCount}</strong></div>
           </div>
         </header>
+
+        <section class="qvd-output-table-list" aria-label="QVD table output actions">
+          ${tables.map(table => renderQvdOutputTableCard(table, state)).join('')}
+        </section>
 
         <section class="qvd-review-card">
           <div class="qvd-business-shell">
@@ -164,12 +230,18 @@ function renderQvdOutputPage(container, state) {
     });
   });
   setupQvdHandlers();
+  document.querySelectorAll('.qvd-output-deploy-btn').forEach(button => {
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      store.navigate('deploy');
+    });
+  });
 }
 
 function renderQvdOutputSection(active, tables, state) {
   if (active === 'overview') {
-    const loadCount = Object.values(state.qvdDatabricksLoadScripts || {}).filter(result => result?.generated).length;
-    const packageCount = Object.values(state.qvdMigrationPackages || {}).filter(result => result?.generated).length;
+    const { loadScriptsCount, packagesCount } = qvdOutputCounts(state);
+    const firstFileName = tables[0]?.summary?.file_name || '';
     return `
       <div class="qvd-business-section-header">
         <div>
@@ -179,10 +251,11 @@ function renderQvdOutputSection(active, tables, state) {
       </div>
       <div class="qvd-profile-summary">
         <div class="qvd-profile-card"><span>QVD Tables</span><strong>${tables.length}</strong></div>
-        <div class="qvd-profile-card"><span>Load Scripts</span><strong>${loadCount}</strong></div>
-        <div class="qvd-profile-card"><span>Packages</span><strong>${packageCount}</strong></div>
+        <div class="qvd-profile-card"><span>Load Scripts</span><strong>${loadScriptsCount}</strong></div>
+        <div class="qvd-profile-card"><span>Packages</span><strong>${packagesCount}</strong></div>
       </div>
-      <div class="inspect-empty">Select a QVD table from the left to review load scripts and generate or download its migration package.</div>
+      ${firstFileName ? renderQvdOutputActions(firstFileName, state) : ''}
+      <div class="inspect-empty">Select a QVD table from the left to review generated scripts and package details.</div>
     `;
   }
   const table = tables.find(item => (item.summary?.file_name || '') === active) || tables[0];
@@ -201,6 +274,7 @@ function renderQvdOutputSection(active, tables, state) {
         </span>
       </div>
       <div style="padding:14px 16px">
+        ${renderQvdOutputActions(fileName, state)}
         ${renderQvdDatabricksLoadScripts(fileName, state)}
         ${renderQvdMigrationPackage(fileName, state)}
       </div>

@@ -342,7 +342,7 @@ async function handleQvdSaveApprovedMapping() {
   try {
     const result = await api.saveApprovedQvdMapping(sessionId, rows);
     store.set({
-      qvdApprovedMapping: result,
+      qvdApprovedMapping: { ...result, mapping_rows: rows },
       qvdDdlGeneration: null,
       isSavingQvdMapping: false,
       qvdMappingValidationErrors: [],

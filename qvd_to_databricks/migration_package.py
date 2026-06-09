@@ -119,7 +119,6 @@ def generate_migration_package(
     errors = []
 
     if not os.path.exists(validation_path):
-        errors.append("Parquet validation report not found.")
         validation = {}
     else:
         validation = _read_json(validation_path)
@@ -180,7 +179,15 @@ def generate_migration_package(
     _copy_if_exists(source_structure_path, destinations["source_structure"])
     _copy_if_exists(approved_mapping_path, destinations["approved_mapping"])
     _copy_if_exists(create_table_path, destinations["create_table"])
-    _copy_if_exists(validation_path, destinations["parquet_validation"])
+    if not _copy_if_exists(validation_path, destinations["parquet_validation"]):
+        with open(destinations["parquet_validation"], "w", encoding="utf-8") as handle:
+            json.dump({
+                "success": None,
+                "passed": None,
+                "target_table": target_table,
+                "parquet_path": load_config.get("parquet_path") or "",
+                "message": "Parquet validation was not generated before packaging.",
+            }, handle, indent=2, ensure_ascii=False)
     _copy_if_exists(load_sql_path, destinations["load_sql"])
     with open(destinations["summary"], "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)

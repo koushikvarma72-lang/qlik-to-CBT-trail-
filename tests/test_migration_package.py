@@ -102,11 +102,32 @@ class MigrationPackageTests(unittest.TestCase):
                 json={"target_table": "sales_sample", "file_name": "Sales_Sample_3_1.qvd"},
             )
             payload = response.get_json()
-            zip_exists = os.path.exists(payload["migration_package_zip"])
+            zip_exists = os.path.exists(os.path.join(output_dir, "migration_package", payload["migration_package_zip"]))
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["generated"])
         self.assertTrue(zip_exists)
+        self.assertFalse(payload["migration_package_zip"].startswith("/"))
+        self.assertEqual(payload["download_url"], f"/api/qvd/download-migration-package/{session_id}")
+
+    def test_package_route_creates_zip_without_validation_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_id = "package-session"
+            output_dir = os.path.join(tmp, session_id, "qvd_outputs")
+            build_package_fixture(output_dir)
+            os.unlink(os.path.join(output_dir, "parquet_validation_sales_sample.json"))
+
+            app = Flask(__name__)
+            register_qvd_routes(app, tmp)
+            response = app.test_client().post(
+                f"/api/qvd/generate-migration-package/{session_id}",
+                json={"target_table": "sales_sample", "file_name": "Sales_Sample_3_1.qvd"},
+            )
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["generated"])
+        self.assertFalse(payload["migration_package_zip"].startswith("/"))
 
     def test_package_download_route_returns_zip(self):
         with tempfile.TemporaryDirectory() as tmp:

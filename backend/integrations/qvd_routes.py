@@ -8,6 +8,8 @@ import os
 import socket
 import uuid
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request, send_file
 from werkzeug.utils import secure_filename
@@ -60,6 +62,7 @@ from qvd_to_databricks.databricks_loader import (
     validation_report_passed,
 )
 from qvd_to_databricks.ddl_generator import generate_delta_ddl_from_approved_mapping
+from qvd_to_databricks.ddl_generator import read_approved_mapping_csv, safe_sql_filename
 from qvd_to_databricks.migration_package import generate_migration_package
 from qvd_to_databricks.parquet_validator import validate_parquet_output, write_validation_artifact
 from qvd_to_databricks.qvd_inspector import inspect_qvd_file, write_inspection_artifacts
@@ -82,6 +85,17 @@ def _safe_preview_artifact_name(file_name: str) -> str:
     return safe_name.replace(".", "_")
 
 
+def _read_json_if_exists(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _quote_artifact_path(relative_path: str) -> str:
+    return "/".join(quote(part) for part in str(relative_path or "").split("/"))
+
+
 def register_qvd_routes(app, upload_folder, call_ai=None):
     qvd_bp = Blueprint(f"qvd_{id(app)}", __name__)
     use_configured_storage = os.path.abspath(upload_folder) == os.path.abspath(UPLOAD_FOLDER)
@@ -101,21 +115,242 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             return safe_join(MIGRATION_PACKAGE_FOLDER, session_id, "migration_package.zip")
         return os.path.join(upload_folder, session_id, "qvd_outputs", "migration_package", "migration_package.zip")
 
-    @qvd_bp.route("/session/<session_id>", methods=["GET"])
-    def qvd_session(session_id):
+    def qvd_public_artifact(session_id: str, path: str | None, *, output_dir: str | None = None, package: bool = False) -> dict | None:
+        if not path:
+            return None
+        output_dir = output_dir or qvd_output_dir(session_id)
+        path_obj = Path(path)
+        if not path_obj.exists():
+            return None
+
+        if package:
+            base_dir = Path(MIGRATION_PACKAGE_FOLDER if use_configured_storage else os.path.dirname(qvd_package_zip_path(session_id))).resolve()
+            relative_path = path_obj.resolve().relative_to(base_dir).as_posix()
+            download_url = f"/api/qvd/download-migration-package/{quote(session_id)}"
+        else:
+            base_dir = Path(output_dir).resolve()
+            relative_path = path_obj.resolve().relative_to(base_dir).as_posix()
+            download_url = f"/api/qvd/download-artifact/{quote(session_id)}/{_quote_artifact_path(relative_path)}"
+
+        return {
+            "file_name": path_obj.name,
+            "relative_path": relative_path,
+            "download_url": download_url,
+        }
+
+    def qvd_public_artifacts(session_id: str, artifacts: dict | None, *, output_dir: str | None = None, package: bool = False) -> dict:
+        public = {}
+        for name, path in (artifacts or {}).items():
+            metadata = qvd_public_artifact(session_id, path, output_dir=output_dir, package=package)
+            if metadata:
+                public[name] = metadata
+        return public
+
+    def qvd_public_runtime_path(path: str | None, *, output_dir: str) -> str:
+        raw = str(path or "")
+        if not raw:
+            return ""
+        try:
+            path_obj = Path(raw)
+            if path_obj.is_absolute():
+                return path_obj.resolve().relative_to(Path(output_dir).resolve()).as_posix()
+        except (OSError, ValueError):
+            pass
+        return raw
+
+    def qvd_response_paths(session_id: str, result: dict, *, output_dir: str, package: bool = False) -> dict:
+        payload = dict(result or {})
+        original_artifacts = payload.get("artifacts") or {}
+        payload["artifact_paths"] = {
+            name: meta["relative_path"]
+            for name, meta in qvd_public_artifacts(session_id, original_artifacts, output_dir=output_dir, package=package).items()
+        }
+        payload["artifact_downloads"] = qvd_public_artifacts(session_id, original_artifacts, output_dir=output_dir, package=package)
+        payload["artifacts"] = payload["artifact_downloads"]
+
+        if isinstance(payload.get("sql_preview"), dict):
+            normalized_preview = {}
+            for path, sql in payload["sql_preview"].items():
+                metadata = qvd_public_artifact(session_id, path, output_dir=output_dir)
+                normalized_preview[metadata["relative_path"] if metadata else os.path.basename(str(path))] = sql
+            payload["sql_preview"] = normalized_preview
+
+        for key in (
+            "approved_mapping_csv",
+            "documentation_path",
+            "conversion_report_json",
+            "validation_report_json",
+            "config_path",
+            "status_path",
+        ):
+            metadata = qvd_public_artifact(session_id, payload.get(key), output_dir=output_dir)
+            if metadata:
+                payload[key] = metadata["relative_path"]
+                payload[f"{key}_download"] = metadata
+
+        package_dir_metadata = qvd_public_artifact(session_id, payload.get("package_dir"), output_dir=output_dir, package=True)
+        if package_dir_metadata:
+            payload["package_dir"] = package_dir_metadata["relative_path"]
+
+        zip_metadata = qvd_public_artifact(session_id, payload.get("migration_package_zip"), output_dir=output_dir, package=True)
+        if zip_metadata:
+            payload["migration_package_zip"] = zip_metadata["relative_path"]
+            payload["migration_package"] = zip_metadata
+            payload["download_url"] = zip_metadata["download_url"]
+
+        if "parquet_path" in payload:
+            payload["parquet_path"] = qvd_public_runtime_path(payload.get("parquet_path"), output_dir=output_dir)
+
+        return payload
+
+    def qvd_mapping_rows_by_file(output_dir: str) -> dict[str, list[dict]]:
+        mapping_path = os.path.join(output_dir, "approved_databricks_mapping.csv")
+        if not os.path.exists(mapping_path):
+            return {}
+        rows_by_file: dict[str, list[dict]] = {}
+        for row in read_approved_mapping_csv(mapping_path):
+            file_name = str(row.get("qvd_file") or "").strip()
+            if file_name:
+                rows_by_file.setdefault(file_name, []).append(row)
+        return rows_by_file
+
+    def qvd_target_table_for_file(file_name: str, table: dict, rows_by_file: dict[str, list[dict]]) -> str:
+        rows = rows_by_file.get(file_name) or []
+        if rows:
+            return str(rows[0].get("target_table") or "").strip()
+        summary = table.get("summary") or {}
+        return safe_sql_filename(summary.get("table_name") or os.path.splitext(file_name)[0] or "")
+
+    def qvd_build_session_state(session_id: str) -> dict:
         output_dir = qvd_output_dir(session_id)
         inspection_path = os.path.join(output_dir, "qvd_inspection.json")
         if not os.path.exists(inspection_path):
-            return jsonify({"error": "QVD inspection artifact not found for this session"}), 404
+            raise FileNotFoundError("QVD inspection artifact not found for this session")
 
-        with open(inspection_path, encoding="utf-8") as handle:
-            inspection = json.load(handle)
+        inspection = _read_json_if_exists(inspection_path)
+        rows_by_file = qvd_mapping_rows_by_file(output_dir)
+        approved_mapping_path = os.path.join(output_dir, "approved_databricks_mapping.csv")
+        ddl_dir = os.path.join(output_dir, "ddl")
+        ddl_files = sorted(
+            os.path.join(ddl_dir, name)
+            for name in os.listdir(ddl_dir)
+            if name.endswith(".sql")
+        ) if os.path.isdir(ddl_dir) else []
 
-        return jsonify({
+        qvd_databricks_load_scripts = {}
+        qvd_migration_packages = {}
+        qvd_parquet_validations = {}
+        qvd_parquet_conversions = {}
+
+        for table in inspection.get("tables") or []:
+            summary = table.get("summary") or {}
+            file_name = summary.get("file_name") or ""
+            target_table = qvd_target_table_for_file(file_name, table, rows_by_file)
+            if not file_name or not target_table:
+                continue
+
+            validation_path = os.path.join(output_dir, f"parquet_validation_{target_table}.json")
+            validation = _read_json_if_exists(validation_path)
+            if validation:
+                validation["artifacts"] = qvd_public_artifacts(session_id, {"validation_report_json": validation_path}, output_dir=output_dir)
+                qvd_parquet_validations[file_name] = validation
+                if validation.get("parquet_path"):
+                    qvd_parquet_conversions[file_name] = {
+                        "success": True,
+                        "target_table": target_table,
+                        "parquet_path": validation.get("parquet_path"),
+                    }
+
+            load_config_path = os.path.join(output_dir, "databricks_load", "load_config.json")
+            if os.path.exists(load_config_path):
+                load_config = _read_json_if_exists(load_config_path)
+                if str(load_config.get("target_table") or "").strip() == target_table:
+                    load_artifacts = {
+                        "create_table_sql": os.path.join(output_dir, "databricks_load", "create_table.sql"),
+                        "insert_select_cast_sql": os.path.join(output_dir, "databricks_load", "insert_select_cast.sql"),
+                        "validation_sql": os.path.join(output_dir, "databricks_load", "validation.sql"),
+                        "load_sql": os.path.join(output_dir, "databricks_load", "load_parquet_to_delta.sql"),
+                        "load_config_json": load_config_path,
+                        "readme": os.path.join(output_dir, "databricks_load", "README_load_steps.md"),
+                    }
+                    qvd_databricks_load_scripts[file_name] = {
+                        "generated": True,
+                        "mode": load_config.get("mode") or "script_artifact",
+                        "target_table": target_table,
+                        "qualified_table": load_config.get("qualified_table"),
+                        "parquet_path": qvd_public_runtime_path(load_config.get("parquet_path"), output_dir=output_dir),
+                        "local_path_warning": load_config.get("local_path_warning") or "",
+                        "artifacts": qvd_public_artifacts(session_id, load_artifacts, output_dir=output_dir),
+                        "errors": [],
+                    }
+
+            package_zip = qvd_package_zip_path(session_id)
+            if not os.path.exists(package_zip):
+                package_zip = os.path.join(output_dir, "migration_package", "migration_package.zip")
+            package_summary_path = os.path.join(os.path.dirname(package_zip), "migration_summary.json")
+            package_summary = _read_json_if_exists(package_summary_path)
+            if package_summary and str(package_summary.get("target_table") or "").strip() == target_table and os.path.exists(package_zip):
+                qvd_migration_packages[file_name] = {
+                    "generated": True,
+                    "target_table": target_table,
+                    "migration_package_zip": qvd_public_artifact(session_id, package_zip, output_dir=output_dir, package=True)["relative_path"],
+                    "migration_package": qvd_public_artifact(session_id, package_zip, output_dir=output_dir, package=True),
+                    "download_url": f"/api/qvd/download-migration-package/{quote(session_id)}",
+                    "summary": package_summary,
+                    "artifacts": qvd_public_artifacts(session_id, {"zip": package_zip}, output_dir=output_dir, package=True),
+                    "errors": [],
+                }
+
+        ddl_sql_preview = {}
+        for ddl_file in ddl_files:
+            try:
+                ddl_sql_preview[qvd_public_artifact(session_id, ddl_file, output_dir=output_dir)["relative_path"]] = Path(ddl_file).read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+        return {
             "session_id": session_id,
             "sessionType": "qvd",
             "qvdInspection": inspection,
-        })
+            "uploaded_files": inspection.get("uploaded_files") or [],
+            "tables": inspection.get("tables") or [],
+            "approved_mapping": {
+                "exists": os.path.exists(approved_mapping_path),
+                "path": qvd_public_artifact(session_id, approved_mapping_path, output_dir=output_dir),
+                "rows_by_file": rows_by_file,
+            },
+            "qvdApprovedMapping": {
+                "saved": os.path.exists(approved_mapping_path),
+                "artifacts": qvd_public_artifacts(session_id, {"approved_mapping_csv": approved_mapping_path}, output_dir=output_dir),
+                "mapping_rows": [row for rows in rows_by_file.values() for row in rows],
+            } if os.path.exists(approved_mapping_path) else None,
+            "qvdDdlGeneration": {
+                "generated": bool(ddl_files),
+                "ddl_files": [qvd_public_artifact(session_id, path, output_dir=output_dir)["relative_path"] for path in ddl_files],
+                "table_count": len(ddl_files),
+                "errors": [],
+                "sql_preview": ddl_sql_preview,
+                "artifacts": qvd_public_artifacts(session_id, {os.path.basename(path): path for path in ddl_files}, output_dir=output_dir),
+            } if ddl_files else None,
+            "qvdParquetConversions": qvd_parquet_conversions,
+            "qvdParquetValidations": qvd_parquet_validations,
+            "qvdDatabricksLoadScripts": qvd_databricks_load_scripts,
+            "qvdMigrationPackages": qvd_migration_packages,
+            "progress": {
+                "inspection": True,
+                "approved_mapping": os.path.exists(approved_mapping_path),
+                "ddl": bool(ddl_files),
+                "load_scripts": any(item.get("generated") for item in qvd_databricks_load_scripts.values()),
+                "migration_package": any(item.get("generated") for item in qvd_migration_packages.values()),
+            },
+        }
+
+    @qvd_bp.route("/session/<session_id>", methods=["GET"])
+    def qvd_session(session_id):
+        try:
+            return jsonify(qvd_build_session_state(session_id))
+        except FileNotFoundError:
+            return jsonify({"error": "QVD inspection artifact not found for this session"}), 404
 
     @qvd_bp.route("/upload-inspect", methods=["POST"])
     def qvd_upload_inspect():
@@ -381,6 +616,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             catalog_schema,
         )
         status = 200 if result["generated"] else 400
+        result = qvd_response_paths(session_id, result, output_dir=output_dir)
         return jsonify({
             "session_id": session_id,
             **result,
@@ -571,16 +807,8 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
 
         output_dir = qvd_output_dir(session_id)
         validation_report_path = os.path.join(output_dir, f"parquet_validation_{target_table}.json")
-        if not os.path.exists(validation_report_path):
-            return jsonify({
-                "session_id": session_id,
-                "target_table": target_table,
-                "generated": False,
-                "errors": ["Parquet validation report not found. Validate Parquet before generating Databricks load scripts."],
-            }), 404
-
-        validation_report = load_validation_report(validation_report_path)
-        if not validation_report_passed(validation_report):
+        validation_report = load_validation_report(validation_report_path) if os.path.exists(validation_report_path) else {}
+        if validation_report and not validation_report_passed(validation_report):
             return jsonify({
                 "session_id": session_id,
                 "target_table": target_table,
@@ -589,11 +817,12 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
                 "failed_checks": validation_report.get("failed_checks", []),
             }), 400
 
-        parquet_path = (
+        parquet_path = qvd_public_runtime_path(
             payload.get("parquet_path")
             or payload.get("parquetPath")
             or validation_report.get("parquet_path")
-            or os.path.join(output_dir, "parquet", target_table)
+            or os.path.join(output_dir, "parquet", target_table),
+            output_dir=output_dir,
         )
         catalog = str(payload.get("catalog") or "main").strip() or "main"
         schema = str(payload.get("schema") or "qvd_raw").strip() or "qvd_raw"
@@ -605,9 +834,10 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             output_dir=os.path.join(output_dir, "databricks_load"),
             catalog=catalog,
             schema=schema,
-            validation_report_path=validation_report_path,
+            validation_report_path=validation_report_path if os.path.exists(validation_report_path) else None,
             approved_mapping_path=os.path.join(output_dir, "approved_databricks_mapping.csv"),
         )
+        result = qvd_response_paths(session_id, result, output_dir=output_dir)
         return jsonify({
             "session_id": session_id,
             **result,
@@ -632,6 +862,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             file_name=payload.get("file_name") or payload.get("fileName"),
             package_dir=safe_join(MIGRATION_PACKAGE_FOLDER, session_id) if use_configured_storage else None,
         )
+        result = qvd_response_paths(session_id, result, output_dir=output_dir, package=True)
         return jsonify({
             "session_id": session_id,
             **result,

@@ -545,8 +545,12 @@ export function renderQvdDatabricksLoadScripts(fileName, state) {
   }
   if (!result) return '';
 
-  const artifacts = result.artifacts || {};
+  const artifacts = result.artifacts || result.artifact_downloads || {};
   const artifactRows = Object.entries(artifacts).filter(([, value]) => value);
+  const artifactLabel = value => {
+    if (value && typeof value === 'object') return value.relative_path || value.file_name || '';
+    return value || '';
+  };
   return `
     <div class="qvd-load-result ${result.generated ? '' : 'qvd-row-preview-error'}">
       <div class="qvd-parquet-header">
@@ -583,7 +587,7 @@ export function renderQvdDatabricksLoadScripts(fileName, state) {
       ${artifactRows.length ? `
         <div class="qvd-parquet-messages">
           <strong>Artifacts</strong>
-          ${artifactRows.map(([name, value]) => `<div>${escapeHtml(name)}: ${escapeHtml(value)}</div>`).join('')}
+          ${artifactRows.map(([name, value]) => `<div>${escapeHtml(name)}: ${escapeHtml(artifactLabel(value))}</div>`).join('')}
         </div>
       ` : ''}
       ${(result.errors || []).length ? `
@@ -618,12 +622,13 @@ export function renderQvdMigrationPackage(fileName, state) {
   if (!result) return '';
 
   const summary = result.summary || {};
+  const packageDownloadUrl = result.download_url || result.migration_package?.download_url || `/api/qvd/download-migration-package/${encodeURIComponent(state.qvdInspection?.session_id || state.sessionId || '')}`;
   return `
     <div class="qvd-load-result ${result.generated ? '' : 'qvd-row-preview-error'}">
       <div class="qvd-parquet-header">
         <div>
           <strong>Migration Package</strong>
-          <span>${escapeHtml(result.migration_package_zip || '')}</span>
+          <span>${escapeHtml(result.migration_package_zip || result.migration_package?.relative_path || '')}</span>
         </div>
         <span class="badge ${result.generated ? 'badge-success' : 'badge-error'}">${result.generated ? 'Ready' : 'Failed'}</span>
       </div>
@@ -634,8 +639,8 @@ export function renderQvdMigrationPackage(fileName, state) {
           <div class="qvd-profile-card"><span>Validation</span><strong>${summary.validation_passed ? 'PASS' : 'FAIL'}</strong></div>
           <div class="qvd-profile-card"><span>Load Scripts</span><strong>${summary.load_scripts_generated ? 'YES' : 'NO'}</strong></div>
         </div>
-        <div class="qvd-parquet-path">${escapeHtml(result.migration_package_zip || '')}</div>
-        <a class="btn btn-secondary qvd-preview-btn" style="display:inline-flex;margin-top:10px" href="${apiDownloadUrl(`/api/qvd/download-migration-package/${encodeURIComponent(state.qvdInspection?.session_id || state.sessionId || '')}`)}">
+        <div class="qvd-parquet-path">${escapeHtml(result.migration_package_zip || result.migration_package?.relative_path || '')}</div>
+        <a class="btn btn-secondary qvd-preview-btn" style="display:inline-flex;margin-top:10px" href="${apiDownloadUrl(packageDownloadUrl)}">
           Download migration_package.zip
         </a>
       ` : ''}
@@ -928,6 +933,35 @@ function cloneQvdMapping(rows) {
   return JSON.parse(JSON.stringify(rows || []));
 }
 
+function qvdRowsFromApprovedMapping(state) {
+  if (Array.isArray(state.qvdApprovedMapping?.mapping_rows)) return state.qvdApprovedMapping.mapping_rows;
+  if (Array.isArray(state.qvdApprovedMapping?.mapping)) return state.qvdApprovedMapping.mapping;
+  const rowsByFile = state.approved_mapping?.rows_by_file || state.approvedMapping?.rows_by_file || {};
+  return Object.values(rowsByFile).flat();
+}
+
+function qvdTargetTableForFile(fileName, state) {
+  const conversion = state.qvdParquetConversions?.[fileName];
+  if (conversion?.target_table) return conversion.target_table;
+  const validation = state.qvdParquetValidations?.[fileName];
+  if (validation?.target_table) return validation.target_table;
+  const load = state.qvdDatabricksLoadScripts?.[fileName];
+  if (load?.target_table) return load.target_table;
+  const pkg = state.qvdMigrationPackages?.[fileName];
+  if (pkg?.target_table) return pkg.target_table;
+
+  const mappingRow = qvdRowsFromApprovedMapping(state).find(row => row.qvd_file === fileName);
+  if (mappingRow?.target_table) return mappingRow.target_table;
+
+  const table = (state.qvdInspection?.tables || []).find(item => item.summary?.file_name === fileName);
+  const fallback = table?.summary?.table_name || fileName.replace(/\.qvd$/i, '');
+  return fallback
+    .trim()
+    .replace(/[^0-9A-Za-z_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toLowerCase();
+}
+
 async function handleQvdPreviewRows(fileName) {
   const state = store.get();
   const sessionId = state.qvdInspection?.session_id || state.sessionId;
@@ -1088,8 +1122,7 @@ async function handleQvdConvertParquet(fileName) {
 async function handleQvdValidateParquet(fileName) {
   const state = store.get();
   const sessionId = state.qvdInspection?.session_id || state.sessionId;
-  const conversion = state.qvdParquetConversions?.[fileName];
-  const targetTable = conversion?.target_table;
+  const targetTable = qvdTargetTableForFile(fileName, state);
   if (!sessionId || !fileName || !targetTable) return;
 
   store.set({
@@ -1143,8 +1176,7 @@ async function handleQvdValidateParquet(fileName) {
 async function handleQvdGenerateDatabricksLoad(fileName) {
   const state = store.get();
   const sessionId = state.qvdInspection?.session_id || state.sessionId;
-  const conversion = state.qvdParquetConversions?.[fileName];
-  const targetTable = conversion?.target_table;
+  const targetTable = qvdTargetTableForFile(fileName, state);
   if (!sessionId || !fileName || !targetTable) return;
 
   store.set({
