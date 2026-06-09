@@ -276,7 +276,7 @@ export function setupQvdMappingReview() {
   document.getElementById('qvd-save-mapping-btn')?.addEventListener('click', handleQvdSaveApprovedMapping);
   document.getElementById('qvd-generate-ddl-btn')?.addEventListener('click', handleQvdGenerateDdl);
   document.getElementById('qvd-reset-mapping-btn')?.addEventListener('click', handleQvdResetMapping);
-  document.getElementById('qvd-continue-next-btn')?.addEventListener('click', () => store.navigate('review'));
+  document.getElementById('qvd-continue-next-btn')?.addEventListener('click', () => store.navigate('output'));
   document.querySelectorAll('[data-qvd-map-index][data-qvd-map-field]').forEach(input => {
     input.addEventListener('change', handleQvdMappingChange);
   });

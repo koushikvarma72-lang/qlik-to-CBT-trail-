@@ -101,6 +101,22 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             return safe_join(MIGRATION_PACKAGE_FOLDER, session_id, "migration_package.zip")
         return os.path.join(upload_folder, session_id, "qvd_outputs", "migration_package", "migration_package.zip")
 
+    @qvd_bp.route("/session/<session_id>", methods=["GET"])
+    def qvd_session(session_id):
+        output_dir = qvd_output_dir(session_id)
+        inspection_path = os.path.join(output_dir, "qvd_inspection.json")
+        if not os.path.exists(inspection_path):
+            return jsonify({"error": "QVD inspection artifact not found for this session"}), 404
+
+        with open(inspection_path, encoding="utf-8") as handle:
+            inspection = json.load(handle)
+
+        return jsonify({
+            "session_id": session_id,
+            "sessionType": "qvd",
+            "qvdInspection": inspection,
+        })
+
     @qvd_bp.route("/upload-inspect", methods=["POST"])
     def qvd_upload_inspect():
         files = request.files.getlist("files") or request.files.getlist("file")

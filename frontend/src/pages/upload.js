@@ -857,6 +857,8 @@ async function handleQvdInspect() {
   }
 
   store.set({
+    sessionType: 'qvd',
+    uploadMode: 'qvd',
     isUploading: true,
     isProcessing: true,
     uploadingFilename: files.length === 1 ? files[0].name : `${files.length} QVD files`,
@@ -885,6 +887,8 @@ async function handleQvdInspect() {
     const result = await api.uploadInspectQvd(files, store.get().sessionId);
     store.set({
       sessionId: result.session_id,
+      sessionType: 'qvd',
+      uploadMode: 'qvd',
       qvdInspection: result,
       isUploading: false,
       isProcessing: false,
@@ -1263,6 +1267,8 @@ async function handleFileUpload(file) {
 
     store.set({
       sessionId: sessionId,
+      sessionType: 'qvf',
+      uploadMode: 'qvf',
       fileId: result.fileId || uploadResult.fileId,
       filename: result.filename || uploadResult.filename,
       graph: enrichedGraph,

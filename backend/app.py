@@ -126,7 +126,13 @@ def _publicize_storage_paths(value, downloads, key_name=None):
 
 @app.after_request
 def add_generated_file_download_metadata(response):
-    if not response.is_json:
+    if response.direct_passthrough:
+        return response
+    if request.path.startswith("/api/files/"):
+        return response
+    if response.mimetype != "application/json":
+        return response
+    if not request.path.startswith("/api/"):
         return response
     payload = response.get_json(silent=True)
     if not isinstance(payload, (dict, list)):

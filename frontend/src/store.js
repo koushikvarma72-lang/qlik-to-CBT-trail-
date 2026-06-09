@@ -6,6 +6,7 @@
 const state = {
   currentPage: 'upload',      // 'upload' | 'business' | 'inspect' | 'review' | 'output' | 'deploy' | 'agent'
   sessionId: null,
+  sessionType: 'qvf',
   currentFileId: null,
   fileId: null,
   filename: null,
@@ -117,12 +118,26 @@ export const store = {
 
   set(updates) {
     Object.assign(state, updates);
+    if (updates.uploadMode === 'qvd' && updates.sessionType === undefined) {
+      state.sessionType = 'qvd';
+    } else if (updates.uploadMode === 'qvf' && updates.sessionType === undefined) {
+      state.sessionType = 'qvf';
+    }
+    if (updates.sessionType !== undefined) {
+      if (updates.sessionType) {
+        localStorage.setItem('qvf_session_type', updates.sessionType);
+      } else {
+        localStorage.removeItem('qvf_session_type');
+      }
+    }
     // Persist sessionId so a page refresh can restore the session
     if (updates.sessionId !== undefined) {
       if (updates.sessionId) {
         localStorage.setItem('qvf_session_id', updates.sessionId);
+        localStorage.setItem('qvf_session_type', state.sessionType || state.uploadMode || 'qvf');
       } else {
         localStorage.removeItem('qvf_session_id');
+        localStorage.removeItem('qvf_session_type');
       }
     }
     state._listeners.forEach(fn => fn(state));
@@ -242,6 +257,7 @@ export const store = {
   reset() {
     Object.assign(state, {
       sessionId: null,
+      sessionType: 'qvf',
       currentFileId: null,
       fileId: null,
       filename: null,
@@ -332,6 +348,7 @@ export const store = {
       isExecutingDatabricksMigration: false,
     });
     localStorage.removeItem('qvf_session_id');
+    localStorage.removeItem('qvf_session_type');
     state._listeners.forEach(fn => fn(state));
   },
 };
@@ -342,10 +359,13 @@ if (['upload', 'business', 'inspect', 'review', 'output', 'deploy', 'agent'].inc
   state.currentPage = hash;
 }
 
-// Restore sessionId from localStorage so a page refresh reconnects to the active session.
-// The app should call api.getModel(sessionId) after this to rehydrate full state.
+// Restore session metadata from localStorage so a page refresh reconnects to
+// the active QVF or QVD session through the matching API.
 const _storedSessionId = localStorage.getItem('qvf_session_id');
+const _storedSessionType = localStorage.getItem('qvf_session_type');
 if (_storedSessionId) {
   state.sessionId = _storedSessionId;
+  state.sessionType = _storedSessionType || 'qvf';
+  state.uploadMode = state.sessionType === 'qvd' ? 'qvd' : 'qvf';
 }
 

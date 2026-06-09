@@ -473,6 +473,20 @@ export function renderReviewPage(container, options = {}) {
   const preserveGraph = !!options.preserveGraph;
   const existingGraphArea = preserveGraph ? document.getElementById('review-graph-area') : null;
 
+  if (state.uploadMode === 'qvd' || state.sessionType === 'qvd') {
+    if (!state.qvdInspection && state.sessionId) {
+      loadQvdSessionData(state.sessionId, container);
+      container.innerHTML = `<div class="page"><div class="empty-state"><div class="spinner spinner-lg"></div><div class="empty-state-title" style="margin-top:16px">Loading QVD session...</div></div></div>`;
+      return;
+    }
+    if (state.qvdInspection) {
+      store.navigate('output');
+      return;
+    }
+    store.navigate('upload');
+    return;
+  }
+
   // If no data, redirect to upload
   if (!state.filename) {
     if (state.sessionId) {
@@ -1156,7 +1170,27 @@ function setupButtons() {
   });
 }
 
+async function loadQvdSessionData(sessionId, container) {
+  try {
+    const data = await api.getQvdSession(sessionId);
+    store.set({
+      sessionId,
+      sessionType: 'qvd',
+      uploadMode: 'qvd',
+      qvdInspection: data.qvdInspection || data,
+    });
+    store.navigate('output');
+  } catch (err) {
+    console.error('Failed to load QVD session:', err);
+    store.navigate('upload');
+  }
+}
+
 async function loadSessionData(sessionId, container) {
+  if (store.get().uploadMode === 'qvd' || store.get().sessionType === 'qvd') {
+    await loadQvdSessionData(sessionId, container);
+    return;
+  }
   try {
     const data = await api.getModel(sessionId);
 

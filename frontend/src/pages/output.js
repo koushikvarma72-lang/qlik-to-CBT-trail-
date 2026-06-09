@@ -112,20 +112,6 @@ export function renderOutputPage(container) {
 
 function renderQvdOutputPage(container, state) {
   const tables = state.qvdInspection?.tables || [];
-  const hasLoadScripts = Object.values(state.qvdDatabricksLoadScripts || {}).some(result => result?.generated);
-  if (!hasLoadScripts) {
-    container.innerHTML = `
-      <div class="page">
-        <div class="empty-state" style="margin:auto">
-          <div class="empty-state-title">Load Scripts Required</div>
-          <div class="empty-state-text">Generate Databricks load scripts in the Next Step page before packaging output artifacts.</div>
-          <button class="btn btn-primary" id="qvd-output-next-btn">Go To Next Step</button>
-        </div>
-      </div>
-    `;
-    document.getElementById('qvd-output-next-btn')?.addEventListener('click', () => store.navigate('review'));
-    return;
-  }
   if (activeQvdOutputSection !== 'overview' && !tables.some(table => (table.summary?.file_name || '') === activeQvdOutputSection)) {
     activeQvdOutputSection = 'overview';
   }

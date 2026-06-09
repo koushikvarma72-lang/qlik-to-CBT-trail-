@@ -168,6 +168,11 @@ export const api = {
     return parseApiResponse(res, 'QVD DDL generation failed');
   },
 
+  async getQvdSession(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/session/${encodeURIComponent(sessionId)}`);
+    return parseApiResponse(res, 'Failed to load QVD session');
+  },
+
   async previewQvdRows(sessionId, fileName, limit = 100) {
     const res = await fetch(`${API_BASE}/qvd/preview-rows/${encodeURIComponent(sessionId)}`, {
       method: 'POST',

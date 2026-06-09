@@ -30,6 +30,25 @@ class HealthAndFilesApiTests(unittest.TestCase):
         response = app_module.app.test_client().get("/api/files/%2e%2e/secret.txt")
         self.assertEqual(response.status_code, 400)
 
+    def test_files_download_does_not_parse_direct_passthrough_as_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original = app_module.DATA_ROOT
+            try:
+                app_module.DATA_ROOT = tmp
+                file_path = os.path.join(tmp, "generated_artifact.sql")
+                with open(file_path, "w", encoding="utf-8") as handle:
+                    handle.write("select 1;\n")
+
+                response = app_module.app.test_client().get("/api/files/generated_artifact.sql")
+                body = response.data
+                response.close()
+            finally:
+                app_module.DATA_ROOT = original
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body, b"select 1;\n")
+        self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

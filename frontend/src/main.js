@@ -209,13 +209,31 @@ window.addEventListener('hashchange', () => {
 });
 
 // ─── Initial Render ──────────────────────────────────────────────────────────
+function restoreQvdSession(payload, sessionId) {
+  const inspection = payload.qvdInspection || payload;
+  store.set({
+    sessionId,
+    sessionType: 'qvd',
+    uploadMode: 'qvd',
+    qvdInspection: inspection,
+  });
+}
+
 (async () => {
   // Restore a previous session from localStorage so a page refresh doesn't
   // wipe the user's work.  If no saved session exists we start fresh.
   const savedSessionId = localStorage.getItem('qvf_session_id');
+  const savedSessionType = localStorage.getItem('qvf_session_type');
 
   if (savedSessionId) {
     try {
+      if (savedSessionType === 'qvd') {
+        const data = await api.getQvdSession(savedSessionId);
+        restoreQvdSession(data, savedSessionId);
+        renderApp();
+        return;
+      }
+
       const data = await api.getModel(savedSessionId);
 
       const enrichedGraph = {
@@ -228,6 +246,8 @@ window.addEventListener('hashchange', () => {
 
       store.set({
         sessionId: savedSessionId,
+        sessionType: 'qvf',
+        uploadMode: 'qvf',
         fileId: data.fileId,
         currentFileId: data.fileId,
         filename: data.filename,
@@ -278,6 +298,16 @@ window.addEventListener('hashchange', () => {
         store.setCurrentFile(data.fileId, store.getFileReviewState(data.fileId) || {});
       }
     } catch (err) {
+      if (savedSessionType !== 'qvd') {
+        try {
+          const data = await api.getQvdSession(savedSessionId);
+          restoreQvdSession(data, savedSessionId);
+          renderApp();
+          return;
+        } catch {
+          // Fall through to clearing the invalid session below.
+        }
+      }
       // Session no longer valid on the server — start clean
       console.warn('Could not restore session, starting fresh:', err.message);
       localStorage.removeItem('qvf_session_id');

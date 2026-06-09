@@ -35,6 +35,10 @@ UI_POST_ROUTES = {
     "/api/qvd/databricks/execute/<session_id>",
 }
 
+UI_GET_ROUTES = {
+    "/api/qvd/session/<session_id>",
+}
+
 CRITICAL_FRONTEND_QVD_ENDPOINTS = [
     "/api/qvd/business-analysis/entities/route-session",
     "/api/qvd/business-analysis/kpis/route-session",
@@ -56,6 +60,35 @@ class QvdRouteContractTests(unittest.TestCase):
 
         self.assertEqual(missing, [])
         self.assertEqual(not_post, [])
+
+    def test_all_ui_qvd_get_routes_are_registered_for_get(self):
+        app = Flask(__name__)
+        with tempfile.TemporaryDirectory() as tmp:
+            register_qvd_routes(app, tmp)
+
+        routes = {str(rule): rule.methods for rule in app.url_map.iter_rules()}
+        missing = sorted(route for route in UI_GET_ROUTES if route not in routes)
+        not_get = sorted(route for route in UI_GET_ROUTES if route in routes and "GET" not in routes[route])
+
+        self.assertEqual(missing, [])
+        self.assertEqual(not_get, [])
+
+    def test_qvd_session_route_returns_inspection_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_id = "session-route"
+            output_dir = os.path.join(tmp, session_id, "qvd_outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "qvd_inspection.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"session_id":"session-route","tables":[],"uploaded_files":[]}')
+
+            app = Flask(__name__)
+            register_qvd_routes(app, tmp)
+            response = app.test_client().get(f"/api/qvd/session/{session_id}")
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["sessionType"], "qvd")
+        self.assertEqual(payload["qvdInspection"]["session_id"], session_id)
 
     def test_critical_frontend_qvd_endpoints_are_not_404(self):
         app = Flask(__name__)
