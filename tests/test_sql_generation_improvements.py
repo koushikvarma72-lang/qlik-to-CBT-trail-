@@ -2305,6 +2305,37 @@ class TestTypedNulls(unittest.TestCase):
         self.assertEqual(result['selected_generation_mode'], 'one_shot')
         self.assertIn(result['one_shot_validation_status'], {'blocking_issues', 'passed', 'passed_with_warnings'})
 
+    def test_auto_mode_with_progress_callback_assigns_one_shot_result(self):
+        try:
+            import flask  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest('Flask is not installed in this test environment')
+        import backend.app as app_mod
+
+        progress_messages = []
+        one_shot_result = {
+            'status': 'complete',
+            'sql': '{{ config(materialized="table") }}\nSELECT 1 AS id',
+            'final_sql': '{{ config(materialized="table") }}\nSELECT 1 AS id',
+            'validation_issues': [],
+        }
+        with patch.object(app_mod, 'request_migration_one_shot', return_value=one_shot_result) as one_shot, \
+             patch.object(app_mod, '_audit_generated_sql_against_plan', return_value=[]), \
+             patch.object(app_mod, '_generic_one_shot_quality_issues', return_value=[]), \
+             patch.object(app_mod, 'request_migration_with_validation') as loop:
+            result = app_mod.migrate_qvs_to_dbt(
+                'FactTable:\nLOAD A FROM FactTable.qvd;',
+                dialect='dbt',
+                generation_mode='auto',
+                progress_callback=progress_messages.append,
+            )
+
+        one_shot.assert_called_once()
+        loop.assert_not_called()
+        self.assertEqual(progress_messages[0], 'Selected generation mode: auto')
+        self.assertEqual(result['selected_generation_mode'], 'auto')
+        self.assertEqual(result['one_shot_validation_status'], 'passed')
+
     def test_generation_mode_loop_skips_one_shot(self):
         try:
             import flask  # noqa: F401

@@ -1545,8 +1545,8 @@ def migrate_qvs_to_dbt(qvs_script, session_context=None, current_sql=None, curre
     if progress_callback:
         progress_callback(f"Selected generation mode: {generation_mode}")
 
-        if (dialect or '').lower() == 'powerbi':
-            result = request_migration_one_shot(
+    if (dialect or '').lower() == 'powerbi':
+        result = request_migration_one_shot(
 
             call_openrouter_fast,
             qvs_script,
