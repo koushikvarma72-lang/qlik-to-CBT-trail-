@@ -39,7 +39,12 @@ from backend.integrations.openrouter_client import (
     call_openrouter_chat_stream,
 )
 from backend.integrations.dbt_routes import register_dbt_agent_routes
-from backend.integrations.qvd_routes import register_qvd_routes
+try:
+    from backend.integrations.qvd_routes import register_qvd_routes
+    QVD_ROUTES_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - keeps non-QVD APIs bootable if optional deps fail.
+    register_qvd_routes = None
+    QVD_ROUTES_IMPORT_ERROR = exc
 from backend.extraction.qvf_runtime import attach_inline_samples_to_tables, build_graph_json, extract_model_from_script, extract_qvf, generate_description_rule_based, parse_sql_sections, prepare_script_for_migration
 from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
 from backend.migration.sql_generation import (
@@ -2391,7 +2396,24 @@ def build_session_bundle(session_id):
 
 register_dbt_agent_routes(app, get_db, build_session_bundle, UPLOAD_FOLDER, call_ai=call_openrouter)
 register_feedback_routes(app, get_db, call_ai=call_openrouter)
-register_qvd_routes(app, UPLOAD_FOLDER, call_ai=call_openrouter if _has_ai_provider_configured() else None)
+if register_qvd_routes is None:
+    logger.error(
+        "QVD routes could not be imported; /api/qvd routes are disabled",
+        exc_info=(
+            type(QVD_ROUTES_IMPORT_ERROR),
+            QVD_ROUTES_IMPORT_ERROR,
+            QVD_ROUTES_IMPORT_ERROR.__traceback__,
+        ),
+    )
+else:
+    registered_qvd_routes = register_qvd_routes(
+        app,
+        UPLOAD_FOLDER,
+        call_ai=call_openrouter if _has_ai_provider_configured() else None,
+    )
+    qvd_route_summary = ", ".join(registered_qvd_routes)
+    logger.info("QVD route startup registration complete: %s", qvd_route_summary)
+    print(f"QVD route startup registration complete: {qvd_route_summary}")
 
 
 def serialize_regeneration_payload(row):

@@ -9,7 +9,7 @@ import socket
 import uuid
 from datetime import datetime
 
-from flask import jsonify, request, send_file
+from flask import Blueprint, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
 from backend.storage_config import (
@@ -83,6 +83,7 @@ def _safe_preview_artifact_name(file_name: str) -> str:
 
 
 def register_qvd_routes(app, upload_folder, call_ai=None):
+    qvd_bp = Blueprint(f"qvd_{id(app)}", __name__)
     use_configured_storage = os.path.abspath(upload_folder) == os.path.abspath(UPLOAD_FOLDER)
 
     def qvd_input_dir(session_id: str) -> str:
@@ -100,7 +101,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             return safe_join(MIGRATION_PACKAGE_FOLDER, session_id, "migration_package.zip")
         return os.path.join(upload_folder, session_id, "qvd_outputs", "migration_package", "migration_package.zip")
 
-    @app.route("/api/qvd/upload-inspect", methods=["POST"])
+    @qvd_bp.route("/upload-inspect", methods=["POST"])
     def qvd_upload_inspect():
         files = request.files.getlist("files") or request.files.getlist("file")
         if not files:
@@ -168,7 +169,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/suggest-schema/<session_id>", methods=["POST"])
+    @qvd_bp.route("/suggest-schema/<session_id>", methods=["POST"])
     def qvd_suggest_schema(session_id):
         output_dir = qvd_output_dir(session_id)
         inspection_path = os.path.join(output_dir, "qvd_inspection.json")
@@ -188,7 +189,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/business-analysis/entities/<session_id>", methods=["POST"])
+    @qvd_bp.route("/business-analysis/entities/<session_id>", methods=["POST"])
     def qvd_business_analysis_entities(session_id):
         output_dir = qvd_output_dir(session_id)
         inspection_path = os.path.join(output_dir, "qvd_inspection.json")
@@ -211,7 +212,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/business-analysis/kpis/<session_id>", methods=["POST"])
+    @qvd_bp.route("/business-analysis/kpis/<session_id>", methods=["POST"])
     def qvd_business_analysis_kpis(session_id):
         output_dir = qvd_output_dir(session_id)
         entities_path = os.path.join(output_dir, "business_analysis", "business_entities.json")
@@ -242,7 +243,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/business-analysis/lineage-reconciliation/<session_id>", methods=["POST"])
+    @qvd_bp.route("/business-analysis/lineage-reconciliation/<session_id>", methods=["POST"])
     def qvd_business_analysis_lineage_reconciliation(session_id):
         output_dir = qvd_output_dir(session_id)
         business_dir = os.path.join(output_dir, "business_analysis")
@@ -296,7 +297,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/business-analysis/ai-explain/<session_id>", methods=["POST"])
+    @qvd_bp.route("/business-analysis/ai-explain/<session_id>", methods=["POST"])
     def qvd_business_analysis_ai_explain(session_id):
         output_dir = qvd_output_dir(session_id)
         business_dir = os.path.join(output_dir, "business_analysis")
@@ -317,7 +318,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/save-approved-mapping/<session_id>", methods=["POST"])
+    @qvd_bp.route("/save-approved-mapping/<session_id>", methods=["POST"])
     def qvd_save_approved_mapping(session_id):
         payload = request.get_json(silent=True) or {}
         mapping_rows = payload.get("mapping_rows")
@@ -343,7 +344,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/generate-ddl/<session_id>", methods=["POST"])
+    @qvd_bp.route("/generate-ddl/<session_id>", methods=["POST"])
     def qvd_generate_ddl(session_id):
         output_dir = qvd_output_dir(session_id)
         approved_mapping_path = os.path.join(output_dir, "approved_databricks_mapping.csv")
@@ -370,7 +371,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         }), status
 
-    @app.route("/api/qvd/preview-rows/<session_id>", methods=["POST"])
+    @qvd_bp.route("/preview-rows/<session_id>", methods=["POST"])
     def qvd_preview_rows(session_id):
         payload = request.get_json(silent=True) or {}
         requested_name = payload.get("file_name") or payload.get("fileName")
@@ -414,7 +415,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
 
         return jsonify(response_payload)
 
-    @app.route("/api/qvd/profile-columns/<session_id>", methods=["POST"])
+    @qvd_bp.route("/profile-columns/<session_id>", methods=["POST"])
     def qvd_profile_columns(session_id):
         payload = request.get_json(silent=True) or {}
         requested_name = payload.get("file_name") or payload.get("fileName")
@@ -459,7 +460,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
 
         return jsonify(response_payload)
 
-    @app.route("/api/qvd/convert-parquet/<session_id>", methods=["POST"])
+    @qvd_bp.route("/convert-parquet/<session_id>", methods=["POST"])
     def qvd_convert_parquet(session_id):
         payload = request.get_json(silent=True) or {}
         requested_name = payload.get("file_name") or payload.get("fileName")
@@ -511,7 +512,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
 
         return jsonify(report_payload), 200 if report.get("success") else 400
 
-    @app.route("/api/qvd/validate-parquet/<session_id>", methods=["POST"])
+    @qvd_bp.route("/validate-parquet/<session_id>", methods=["POST"])
     def qvd_validate_parquet(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -541,7 +542,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
 
         return jsonify(response_payload), 200 if validation.get("success") else 400
 
-    @app.route("/api/qvd/generate-databricks-load/<session_id>", methods=["POST"])
+    @qvd_bp.route("/generate-databricks-load/<session_id>", methods=["POST"])
     def qvd_generate_databricks_load(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -597,7 +598,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         }), 200 if result.get("generated") else 400
 
-    @app.route("/api/qvd/generate-migration-package/<session_id>", methods=["POST"])
+    @qvd_bp.route("/generate-migration-package/<session_id>", methods=["POST"])
     def qvd_generate_migration_package(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -621,7 +622,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         }), 200 if result.get("generated") else 400
 
-    @app.route("/api/qvd/databricks/save-config/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/save-config/<session_id>", methods=["POST"])
     def qvd_databricks_save_config(session_id):
         payload = request.get_json(silent=True) or {}
         output_dir = qvd_output_dir(session_id)
@@ -635,7 +636,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         })
 
-    @app.route("/api/qvd/databricks/test-connection/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/test-connection/<session_id>", methods=["POST"])
     def qvd_databricks_test_connection(session_id):
         payload = request.get_json(silent=True) or {}
         output_dir = qvd_output_dir(session_id)
@@ -673,7 +674,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             raise ValueError(" ".join(errors))
         return output_dir, config
 
-    @app.route("/api/qvd/databricks/warehouses/<session_id>", methods=["GET", "POST"])
+    @qvd_bp.route("/databricks/warehouses/<session_id>", methods=["GET", "POST"])
     def qvd_databricks_warehouses(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -682,7 +683,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "warehouses": [], "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/catalogs/<session_id>", methods=["GET", "POST"])
+    @qvd_bp.route("/databricks/catalogs/<session_id>", methods=["GET", "POST"])
     def qvd_databricks_catalogs(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -691,7 +692,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "catalogs": [], "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/schemas/<session_id>", methods=["GET", "POST"])
+    @qvd_bp.route("/databricks/schemas/<session_id>", methods=["GET", "POST"])
     def qvd_databricks_schemas(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -701,7 +702,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "schemas": [], "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/volumes/<session_id>", methods=["GET", "POST"])
+    @qvd_bp.route("/databricks/volumes/<session_id>", methods=["GET", "POST"])
     def qvd_databricks_volumes(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -712,7 +713,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "volumes": [], "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/create-schema/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/create-schema/<session_id>", methods=["POST"])
     def qvd_databricks_create_schema(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -725,7 +726,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "success": False, "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/create-volume/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/create-volume/<session_id>", methods=["POST"])
     def qvd_databricks_create_volume(session_id):
         payload = request.get_json(silent=True) or {}
         try:
@@ -741,7 +742,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "success": False, "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/upload-parquet/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/upload-parquet/<session_id>", methods=["POST"])
     def qvd_databricks_upload_parquet(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -782,7 +783,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         except Exception as exc:
             return jsonify({"session_id": session_id, "success": False, "errors": [str(exc)]}), 400
 
-    @app.route("/api/qvd/databricks/precheck/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/precheck/<session_id>", methods=["POST"])
     def qvd_databricks_precheck(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -794,7 +795,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         result = precheck_execution(output_dir, target_table, mode, config)
         return jsonify({"session_id": session_id, **result}), 200 if result.get("passed") else 400
 
-    @app.route("/api/qvd/databricks/execute/<session_id>", methods=["POST"])
+    @qvd_bp.route("/databricks/execute/<session_id>", methods=["POST"])
     def qvd_databricks_execute(session_id):
         payload = request.get_json(silent=True) or {}
         target_table = str(payload.get("target_table") or payload.get("targetTable") or "").strip()
@@ -895,7 +896,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             "created_at": datetime.utcnow().isoformat(),
         }), 200
 
-    @app.route("/api/qvd/download-migration-package/<session_id>", methods=["GET"])
+    @qvd_bp.route("/download-migration-package/<session_id>", methods=["GET"])
     def qvd_download_migration_package(session_id):
         package_path = qvd_package_zip_path(session_id)
         if use_configured_storage and not os.path.exists(package_path):
@@ -904,7 +905,7 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
             return jsonify({"error": "Migration package zip not found."}), 404
         return send_file(package_path, as_attachment=True, download_name="migration_package.zip")
 
-    @app.route("/api/qvd/download-artifact/<session_id>/<path:artifact_name>", methods=["GET"])
+    @qvd_bp.route("/download-artifact/<session_id>/<path:artifact_name>", methods=["GET"])
     def qvd_download_artifact(session_id, artifact_name):
         safe_name = os.path.normpath(artifact_name).replace("\\", "/")
         if safe_name.startswith("../") or safe_name.startswith("/") or "/../" in safe_name:
@@ -916,3 +917,8 @@ def register_qvd_routes(app, upload_folder, call_ai=None):
         if not os.path.exists(artifact_path) or not os.path.isfile(artifact_path):
             return jsonify({"error": "Artifact not found."}), 404
         return send_file(artifact_path, as_attachment=True, download_name=os.path.basename(artifact_path))
+
+    app.register_blueprint(qvd_bp, url_prefix="/api/qvd")
+    qvd_routes = sorted(str(rule) for rule in app.url_map.iter_rules() if str(rule).startswith("/api/qvd/"))
+    logger.info("Registered QVD routes (%d): %s", len(qvd_routes), ", ".join(qvd_routes))
+    return qvd_routes

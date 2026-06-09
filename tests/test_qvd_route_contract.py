@@ -35,6 +35,14 @@ UI_POST_ROUTES = {
     "/api/qvd/databricks/execute/<session_id>",
 }
 
+CRITICAL_FRONTEND_QVD_ENDPOINTS = [
+    "/api/qvd/business-analysis/entities/route-session",
+    "/api/qvd/business-analysis/kpis/route-session",
+    "/api/qvd/business-analysis/lineage-reconciliation/route-session",
+    "/api/qvd/business-analysis/ai-explain/route-session",
+    "/api/qvd/suggest-schema/route-session",
+]
+
 
 class QvdRouteContractTests(unittest.TestCase):
     def test_all_ui_qvd_post_routes_are_registered_for_post(self):
@@ -48,6 +56,21 @@ class QvdRouteContractTests(unittest.TestCase):
 
         self.assertEqual(missing, [])
         self.assertEqual(not_post, [])
+
+    def test_critical_frontend_qvd_endpoints_are_not_404(self):
+        app = Flask(__name__)
+        with tempfile.TemporaryDirectory() as tmp:
+            register_qvd_routes(app, tmp)
+            client = app.test_client()
+            responses = {
+                endpoint: client.open(endpoint, method="OPTIONS").status_code
+                for endpoint in CRITICAL_FRONTEND_QVD_ENDPOINTS
+            }
+
+        self.assertEqual(
+            {endpoint: status for endpoint, status in responses.items() if status == 404},
+            {},
+        )
 
     def test_artifact_download_route_serves_session_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
