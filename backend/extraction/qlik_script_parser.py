@@ -14,7 +14,7 @@ Complete extraction and analysis of Qlik load scripts:
 """
 
 import re
-from typing import Dict, List, Any, Tuple, Optional, Set
+from typing import Dict, List, Any, Tuple, Optional
 from collections import defaultdict
 
 

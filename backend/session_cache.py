@@ -7,7 +7,7 @@ in server.py.
 Why this matters
 ----------------
 The original SQL_PLAN_CACHE grows without bound for the lifetime of the
-process.  In a demo environment that's fine; in a production deployment that
+process.  In a small local environment that's fine; in a production deployment that
 processes thousands of QVF files it will eventually exhaust memory.
 
 This module provides a drop-in replacement with:

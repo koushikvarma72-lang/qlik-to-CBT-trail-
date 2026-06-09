@@ -3,7 +3,41 @@
  * Handles all communication with the Flask backend
  */
 
-const API_BASE = '/api';
+export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000').replace(/\/+$/, '');
+const API_BASE = `${API_BASE_URL}/api`;
+
+export function apiDownloadUrl(downloadUrl) {
+  if (!downloadUrl) return '#';
+  if (/^https?:\/\//i.test(downloadUrl)) return downloadUrl;
+  if (downloadUrl.startsWith('/api')) return `${API_BASE_URL}${downloadUrl}`;
+  return downloadUrl;
+}
+
+function friendlyMessage(payload, fallbackMessage, statusMessage) {
+  const raw = String(payload.error || (payload.errors || [])[0] || '').trim();
+  if (raw.includes('<!doctype html>') || raw.includes('Method Not Allowed')) {
+    return `${fallbackMessage}: this action is not available from the current backend route. Restart the backend and try again.`;
+  }
+  if (/approved mapping artifact not found/i.test(raw)) {
+    return 'Save the approved mapping before running this step.';
+  }
+  if (/KPI catalog artifact not found/i.test(raw)) {
+    return 'Generate the KPI Catalog & Documentation before running this step.';
+  }
+  if (/Parquet validation report not found/i.test(raw)) {
+    return 'Validate the Parquet output before running Databricks load or deployment steps.';
+  }
+  if (/Parquet path is local/i.test(raw)) {
+    return 'The Parquet output is on your local machine. Configure a Databricks Volume Path or cloud storage path before loading data.';
+  }
+  if (/SQL Warehouse ID is required/i.test(raw)) {
+    return 'Enter a SQL Warehouse ID before testing or executing Databricks deployment.';
+  }
+  if (/valid Databricks Workspace URL|Workspace URL is required/i.test(raw)) {
+    return 'Enter a valid Databricks Workspace URL, for example https://dbc-xxxx.cloud.databricks.com.';
+  }
+  return raw || `${fallbackMessage}: ${statusMessage}`;
+}
 
 async function parseApiResponse(res, fallbackMessage) {
   const text = await res.text();
@@ -19,7 +53,9 @@ async function parseApiResponse(res, fallbackMessage) {
 
   if (!res.ok) {
     const statusMessage = `${res.status}${res.statusText ? ` ${res.statusText}` : ''}`;
-    throw new Error(payload.error || `${fallbackMessage}: ${statusMessage}`);
+    const error = new Error(friendlyMessage(payload, fallbackMessage, statusMessage));
+    Object.assign(error, payload);
+    throw error;
   }
 
   return payload;
@@ -45,6 +81,268 @@ export const api = {
     });
 
     return parseApiResponse(res, 'Upload failed');
+  },
+
+  async uploadInspectQvd(files, sessionId = null) {
+    const formData = new FormData();
+    Array.from(files || []).forEach(file => {
+      formData.append('files', file);
+    });
+    if (sessionId) {
+      formData.append('session_id', sessionId);
+    }
+
+    const res = await fetch(`${API_BASE}/qvd/upload-inspect`, {
+      method: 'POST',
+      body: formData,
+    });
+
+    return parseApiResponse(res, 'QVD inspection failed');
+  },
+
+  async suggestQvdSchema(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/suggest-schema/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+    });
+
+    return parseApiResponse(res, 'QVD schema suggestion failed');
+  },
+
+  async discoverQvdBusinessEntities(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/business-analysis/entities/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    return parseApiResponse(res, 'QVD business entity discovery failed');
+  },
+
+  async generateQvdKpiCatalog(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/business-analysis/kpis/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    return parseApiResponse(res, 'QVD KPI catalog generation failed');
+  },
+
+  async generateQvdLineageReconciliation(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/business-analysis/lineage-reconciliation/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    return parseApiResponse(res, 'QVD lineage and reconciliation generation failed');
+  },
+
+  async generateQvdAiExplanation(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/business-analysis/ai-explain/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    return parseApiResponse(res, 'QVD AI business explanation failed');
+  },
+
+  async saveApprovedQvdMapping(sessionId, mappingRows) {
+    const res = await fetch(`${API_BASE}/qvd/save-approved-mapping/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mapping_rows: mappingRows }),
+    });
+
+    return parseApiResponse(res, 'Approved QVD mapping save failed');
+  },
+
+  async generateQvdDdl(sessionId) {
+    const res = await fetch(`${API_BASE}/qvd/generate-ddl/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    return parseApiResponse(res, 'QVD DDL generation failed');
+  },
+
+  async previewQvdRows(sessionId, fileName, limit = 100) {
+    const res = await fetch(`${API_BASE}/qvd/preview-rows/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_name: fileName, limit }),
+    });
+
+    return parseApiResponse(res, 'QVD row preview failed');
+  },
+
+  async profileQvdColumns(sessionId, fileName, limit = 10000) {
+    const res = await fetch(`${API_BASE}/qvd/profile-columns/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_name: fileName, limit }),
+    });
+
+    return parseApiResponse(res, 'QVD column profiling failed');
+  },
+
+  async convertQvdToParquet(sessionId, fileName, batchId = null) {
+    const body = { file_name: fileName };
+    if (batchId) body.batch_id = batchId;
+    const res = await fetch(`${API_BASE}/qvd/convert-parquet/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    return parseApiResponse(res, 'QVD to Parquet conversion failed');
+  },
+
+  async validateQvdParquet(sessionId, targetTable) {
+    const res = await fetch(`${API_BASE}/qvd/validate-parquet/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_table: targetTable }),
+    });
+
+    return parseApiResponse(res, 'QVD Parquet validation failed');
+  },
+
+  async generateQvdDatabricksLoad(sessionId, targetTable, parquetPath = null) {
+    const body = { target_table: targetTable };
+    if (parquetPath) body.parquet_path = parquetPath;
+    const res = await fetch(`${API_BASE}/qvd/generate-databricks-load/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    return parseApiResponse(res, 'QVD Databricks load script generation failed');
+  },
+
+  async generateQvdMigrationPackage(sessionId, targetTable, fileName = null) {
+    const body = { target_table: targetTable };
+    if (fileName) body.file_name = fileName;
+    const res = await fetch(`${API_BASE}/qvd/generate-migration-package/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    return parseApiResponse(res, 'QVD migration package generation failed');
+  },
+
+  async saveQvdDatabricksConfig(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/save-config/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+
+    return parseApiResponse(res, 'Databricks configuration save failed');
+  },
+
+  async testQvdDatabricksConnection(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/test-connection/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+
+    return parseApiResponse(res, 'Databricks connection test failed');
+  },
+
+  async discoverQvdDatabricksWarehouses(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/warehouses/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks warehouse discovery failed');
+  },
+
+  async discoverQvdDatabricksCatalogs(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/catalogs/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks catalog discovery failed');
+  },
+
+  async discoverQvdDatabricksSchemas(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/schemas/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks schema discovery failed');
+  },
+
+  async discoverQvdDatabricksVolumes(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/volumes/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks volume discovery failed');
+  },
+
+  async createQvdDatabricksSchema(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/create-schema/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks schema creation failed');
+  },
+
+  async createQvdDatabricksVolume(sessionId, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/create-volume/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    return parseApiResponse(res, 'Databricks volume creation failed');
+  },
+
+  async uploadQvdParquetToDatabricksVolume(sessionId, targetTable, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/upload-parquet/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...(config || {}), target_table: targetTable }),
+    });
+    return parseApiResponse(res, 'Databricks volume upload failed');
+  },
+
+  async executeQvdDatabricksMigration(sessionId, targetTable, executionMode, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/execute/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(config || {}),
+        target_table: targetTable,
+        execution_mode: executionMode,
+      }),
+    });
+
+    return parseApiResponse(res, 'Databricks migration execution failed');
+  },
+
+  async precheckQvdDatabricksDeployment(sessionId, targetTable, executionMode, config) {
+    const res = await fetch(`${API_BASE}/qvd/databricks/precheck/${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(config || {}),
+        target_table: targetTable,
+        execution_mode: executionMode,
+      }),
+    });
+
+    return parseApiResponse(res, 'Databricks deployment precheck failed');
   },
 
   /**

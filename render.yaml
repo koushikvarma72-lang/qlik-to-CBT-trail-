@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: qvd-databricks-backend
+    env: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: DATA_ROOT
+        value: /data
+      - key: FLASK_ENV
+        value: production
+      - key: DATABRICKS_CATALOG
+        value: workspace
+      - key: DATABRICKS_SCHEMA
+        value: default
+    disk:
+      name: qvd-databricks-data
+      mountPath: /data
+      sizeGB: 10

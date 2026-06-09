@@ -12,7 +12,7 @@
 
 2. **Run Tests**
    ```bash
-   python tools/test_comprehensive_extraction.py
+   python -m pytest
    ```
 
 3. **Check Server Integration**
@@ -339,7 +339,7 @@ Export lineage graph for:
 - **Full Technical Docs**: See `COMPREHENSIVE_EXTRACTION_README.md`
 - **Implementation Details**: See `IMPLEMENTATION_SUMMARY.md`
 - **API Documentation**: See API endpoints in server documentation
-- **Script Reference**: See Qlik script examples in `test_comprehensive_extraction.py`
+- **Script Reference**: See Qlik script examples in `COMPREHENSIVE_EXTRACTION_README.md`
 
 ---
 

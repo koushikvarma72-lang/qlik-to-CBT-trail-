@@ -25,20 +25,18 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 from datetime import datetime
 from collections import defaultdict
 
+from backend.storage_config import UPLOAD_FOLDER
+
 # Import advanced extraction modules
 try:
     from backend.extraction.qlik_script_parser import parse_qlik_load_script
-    from backend.extraction.advanced_qvf_extractor import extract_advanced_metadata, ExpressionPreserver
+    from backend.extraction.advanced_qvf_extractor import extract_advanced_metadata
 except ImportError:
     # Fallback if imports fail
     def parse_qlik_load_script(text):
         return {'statements': [], 'variables': {}}
     def extract_advanced_metadata(metadata):
         return {}
-    class ExpressionPreserver:
-        def extract_field_references(self, expr):
-            return set()
-
 
 class ComprehensiveMetadataExtractor:
     """Extract ALL Qlik application metadata with full fidelity."""
@@ -322,7 +320,7 @@ class ComprehensiveMetadataExtractor:
             
         # 2. Workspace directory scan fallback
         if not forensic_dir:
-            candidates = glob.glob("uploads/*_extracted/binary_forensics")
+            candidates = glob.glob(os.path.join(UPLOAD_FOLDER, "*", "*_extracted", "binary_forensics"))
             if candidates:
                 forensic_dir = candidates[0]
                 

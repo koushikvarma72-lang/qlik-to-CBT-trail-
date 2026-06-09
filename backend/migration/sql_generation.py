@@ -8,6 +8,7 @@ import zipfile
 from datetime import datetime
 from backend.extraction.qvf_runtime import extract_model_from_script
 from backend.extraction.qlik_script_parser import parse_qlik_load_script
+from backend.storage_config import ARTIFACT_FOLDER
 
 try:
     from backend.migration.ir import (
@@ -4160,7 +4161,7 @@ def generate_dbt_project_scaffold(project_name='qlik_migration_validation') -> d
 
 
 def _validation_artifacts_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'generated_artifacts'))
+    return os.path.abspath(ARTIFACT_FOLDER)
 
 
 def _sanitize_artifact_filename(name: str, default_name: str = 'artifact.sql') -> str:

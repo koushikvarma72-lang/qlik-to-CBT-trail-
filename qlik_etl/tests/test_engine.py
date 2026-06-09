@@ -1,7 +1,6 @@
 import unittest
 
 from qlik_etl import QlikToSqlEngine
-from qlik_etl.errors import QlikParserError
 
 
 class QlikEtlEngineTests(unittest.TestCase):

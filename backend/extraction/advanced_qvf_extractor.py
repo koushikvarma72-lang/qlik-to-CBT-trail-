@@ -13,8 +13,7 @@ Specialized extraction for:
 """
 
 import re
-from typing import Dict, List, Any, Tuple, Set
-from collections import defaultdict
+from typing import Dict, List, Any, Set
 
 
 class ExpressionPreserver:

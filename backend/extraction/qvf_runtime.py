@@ -7,7 +7,9 @@ import re
 import uuid
 import zipfile
 import zlib
+import logging
 
+logger = logging.getLogger(__name__)
 
 # ─── Qlik Variable Resolution ────────────────────────────────────────────────
 
@@ -586,51 +588,57 @@ def _write_binary_artifacts(filepath, extract_dir, literal_evidence, scan_result
 
 
 def _print_binary_terminal_summary(filepath, binary_report, literal_evidence, decoded_sections, undecoded_sections, inferred_model, script_text):
-    print("")
-    print("=" * 78)
-    print(f"BINARY QVF FORENSICS | {os.path.basename(filepath)}")
-    print("=" * 78)
-    print("Confirmed in file (literal bytes)")
-    print(f"  Header: {literal_evidence.get('headerHex', '')}")
-    print(f"  Field marker offset: {literal_evidence.get('fieldZone', {}).get('markerOffset')}")
-    print(f"  Path blocks found: {len(literal_evidence.get('pathBlocks', []))}")
+    lines = [
+        "",
+        "=" * 78,
+        f"BINARY QVF FORENSICS | {os.path.basename(filepath)}",
+        "=" * 78,
+        "Confirmed in file (literal bytes)",
+        f"  Header: {literal_evidence.get('headerHex', '')}",
+        f"  Field marker offset: {literal_evidence.get('fieldZone', {}).get('markerOffset')}",
+        f"  Path blocks found: {len(literal_evidence.get('pathBlocks', []))}",
+    ]
     for block in literal_evidence.get('pathBlocks', [])[:8]:
-        print(
+        lines.append(
             f"    0x{block['offset']:x} | {block['candidateName']} -> {block['path']}"
         )
-    print("")
-    print("Decoded from compressed payload")
-    print(f"  gzjson markers: {binary_report.get('gzjsonMarkerCount', 0)}")
-    print(f"  Decoded sections: {len(decoded_sections)}")
-    print(f"  Undecoded sections: {len(undecoded_sections)}")
+    lines.extend([
+        "",
+        "Decoded from compressed payload",
+        f"  gzjson markers: {binary_report.get('gzjsonMarkerCount', 0)}",
+        f"  Decoded sections: {len(decoded_sections)}",
+        f"  Undecoded sections: {len(undecoded_sections)}",
+    ])
     for section in decoded_sections[:8]:
-        print(
+        lines.append(
             f"    section {section['index']} | marker=0x{section['markerOffset']:x} "
             f"| method={section['compressionMethod']} | bytes={section['decodedBytes']}"
         )
     if undecoded_sections:
-        print("  Undecoded markers")
+        lines.append("  Undecoded markers")
         for section in undecoded_sections[:8]:
-            print(
+            lines.append(
                 f"    section {section['index']} | marker=0x{section['markerOffset']:x} "
                 f"| status={section['status']}"
             )
-    print("")
-    print("Extracted / inferred result")
-    print(f"  Script source: {binary_report.get('scriptSource')}")
-    print(f"  Script found: {bool(script_text)}")
+    lines.extend([
+        "",
+        "Extracted / inferred result",
+        f"  Script source: {binary_report.get('scriptSource')}",
+        f"  Script found: {bool(script_text)}",
+    ])
     if inferred_model:
-        print(f"  Tables extracted: {len(inferred_model.get('tables', []))}")
-        print(f"  Associations extracted: {len(inferred_model.get('associations', []))}")
+        lines.append(f"  Tables extracted: {len(inferred_model.get('tables', []))}")
+        lines.append(f"  Associations extracted: {len(inferred_model.get('associations', []))}")
         for table in inferred_model.get('tables', [])[:8]:
-            print(
+            lines.append(
                 f"    {table['name']} | fields={len(table.get('fields', []))} "
                 f"| source={table.get('sourceFile', '')}"
             )
     else:
-        print("  No inferred table model built")
-    print("=" * 78)
-    print("")
+        lines.append("  No inferred table model built")
+    lines.extend(["=" * 78, ""])
+    logger.info("\n".join(lines))
 
 
 def looks_like_qlik_script_block(block):
@@ -1401,7 +1409,7 @@ def extract_from_binary_qvf(filepath, extract_dir=None):
 
         return result
     except Exception as e:
-        print(f"ERROR: Binary extraction failed: {e}")
+        logger.exception("Binary extraction failed: %s", e)
         return result
 
 
@@ -1470,7 +1478,7 @@ def extract_qvf(filepath, extract_dir):
 
     except Exception as e:
         if not isinstance(e, ValueError):
-            print(f"ERROR: Extraction error: {str(e)}")
+            logger.exception("Extraction error: %s", e)
             raise ValueError(f"Error processing QVF file: {str(e)}")
         raise e
     return result

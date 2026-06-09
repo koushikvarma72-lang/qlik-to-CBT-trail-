@@ -3,10 +3,23 @@
  */
 import { store } from '../store.js';
 import { highlightSQL } from '../components/editor.js';
+import {
+  renderQvdDatabricksLoadScripts,
+  renderQvdMigrationPackage,
+  setupQvdHandlers,
+} from './upload.js';
+import { renderQvdStatusChecklist } from '../components/qvdStatusChecklist.js';
 import { escapeHtml, markdownToHtml } from '../utils.js';
+
+let activeQvdOutputSection = 'overview';
 
 export function renderOutputPage(container) {
   const state = store.get();
+  if (state.uploadMode === 'qvd') {
+    renderQvdOutputPage(container, state);
+    return;
+  }
+
   const structured = state.regeneration || {};
   const sqlOutput = structured.sql || state.regeneratedSql || '';
   const descriptionOutput = structured.description || state.regeneratedText || '';
@@ -95,6 +108,118 @@ export function renderOutputPage(container) {
   `;
 
   setupOutputButtons(state, sqlOutput, descriptionOutput);
+}
+
+function renderQvdOutputPage(container, state) {
+  const tables = state.qvdInspection?.tables || [];
+  const hasLoadScripts = Object.values(state.qvdDatabricksLoadScripts || {}).some(result => result?.generated);
+  if (!hasLoadScripts) {
+    container.innerHTML = `
+      <div class="page">
+        <div class="empty-state" style="margin:auto">
+          <div class="empty-state-title">Load Scripts Required</div>
+          <div class="empty-state-text">Generate Databricks load scripts in the Next Step page before packaging output artifacts.</div>
+          <button class="btn btn-primary" id="qvd-output-next-btn">Go To Next Step</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('qvd-output-next-btn')?.addEventListener('click', () => store.navigate('review'));
+    return;
+  }
+  if (activeQvdOutputSection !== 'overview' && !tables.some(table => (table.summary?.file_name || '') === activeQvdOutputSection)) {
+    activeQvdOutputSection = 'overview';
+  }
+
+  container.innerHTML = `
+    <div class="page qvd-review-page">
+      <main class="qvd-review-main">
+        ${renderQvdStatusChecklist(state)}
+        <header class="inspect-header">
+          <div>
+            <div class="inspect-title">QVD Output</div>
+            <div class="inspect-subtitle">Review generated Databricks load scripts and create the downloadable migration package.</div>
+          </div>
+          <div class="inspect-metrics">
+            <div class="inspect-metric"><span>Load Scripts</span><strong>${Object.values(state.qvdDatabricksLoadScripts || {}).filter(result => result?.generated).length}</strong></div>
+            <div class="inspect-metric"><span>Packages</span><strong>${Object.values(state.qvdMigrationPackages || {}).filter(result => result?.generated).length}</strong></div>
+          </div>
+        </header>
+
+        <section class="qvd-review-card">
+          <div class="qvd-business-shell">
+            <nav class="qvd-business-section-nav" aria-label="QVD Output sections">
+              <button type="button" class="qvd-business-section-link ${activeQvdOutputSection === 'overview' ? 'active' : ''}" data-qvd-output-section="overview">
+                <span>Overview</span>
+                <small>Review generated load scripts and package readiness.</small>
+              </button>
+              ${tables.map(table => {
+                const summary = table.summary || {};
+                const fileName = summary.file_name || '';
+                return `
+                  <button type="button" class="qvd-business-section-link ${activeQvdOutputSection === fileName ? 'active' : ''}" data-qvd-output-section="${escapeHtml(fileName)}">
+                    <span>${escapeHtml(summary.table_name || fileName || 'QVD Table')}</span>
+                    <small>${state.qvdMigrationPackages?.[fileName]?.generated ? 'Package ready' : 'Ready to package'}</small>
+                  </button>
+                `;
+              }).join('')}
+            </nav>
+            <div class="qvd-business-section-panel">
+              ${renderQvdOutputSection(activeQvdOutputSection, tables, state)}
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  `;
+  document.querySelectorAll('[data-qvd-output-section]').forEach(button => {
+    button.addEventListener('click', () => {
+      activeQvdOutputSection = button.dataset.qvdOutputSection || 'overview';
+      renderQvdOutputPage(container, store.get());
+    });
+  });
+  setupQvdHandlers();
+}
+
+function renderQvdOutputSection(active, tables, state) {
+  if (active === 'overview') {
+    const loadCount = Object.values(state.qvdDatabricksLoadScripts || {}).filter(result => result?.generated).length;
+    const packageCount = Object.values(state.qvdMigrationPackages || {}).filter(result => result?.generated).length;
+    return `
+      <div class="qvd-business-section-header">
+        <div>
+          <h3>Overview</h3>
+          <p>Review generated load scripts and package readiness.</p>
+        </div>
+      </div>
+      <div class="qvd-profile-summary">
+        <div class="qvd-profile-card"><span>QVD Tables</span><strong>${tables.length}</strong></div>
+        <div class="qvd-profile-card"><span>Load Scripts</span><strong>${loadCount}</strong></div>
+        <div class="qvd-profile-card"><span>Packages</span><strong>${packageCount}</strong></div>
+      </div>
+      <div class="inspect-empty">Select a QVD table from the left to review load scripts and generate or download its migration package.</div>
+    `;
+  }
+  const table = tables.find(item => (item.summary?.file_name || '') === active) || tables[0];
+  if (!table) return '<div class="inspect-empty">No QVD table selected.</div>';
+  const summary = table.summary || {};
+  const fileName = summary.file_name || '';
+  return `
+    <section class="qvd-metadata-card" style="border:1px solid var(--border);background:rgba(255,255,255,0.76);border-radius:8px">
+      <div style="padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;align-items:flex-start">
+        <div>
+          <h3 style="margin:0 0 4px;color:var(--text-primary);font-size:16px">${escapeHtml(summary.table_name || fileName)}</h3>
+          <div style="font-size:12px;color:var(--text-dim)">${escapeHtml(fileName)}</div>
+        </div>
+        <span class="badge ${state.qvdMigrationPackages?.[fileName]?.generated ? 'badge-success' : 'badge-info'}">
+          ${state.qvdMigrationPackages?.[fileName]?.generated ? 'Package ready' : 'Ready to package'}
+        </span>
+      </div>
+      <div style="padding:14px 16px">
+        ${renderQvdDatabricksLoadScripts(fileName, state)}
+        ${renderQvdMigrationPackage(fileName, state)}
+      </div>
+    </section>
+  `;
 }
 
 function setupOutputButtons(state, sqlOutput, descriptionOutput) {

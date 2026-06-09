@@ -6,9 +6,11 @@ import './styles/main.css';
 import { api } from './api.js';
 import { store } from './store.js';
 import { renderUploadPage, destroyUploadPage } from './pages/upload.js';
+import { renderBusinessPage, destroyBusinessPage } from './pages/business.js';
 import { renderInspectPage, destroyInspectPage } from './pages/inspect.js';
 import { renderReviewPage, destroyReviewPage } from './pages/review.js';
 import { renderOutputPage, destroyOutputPage } from './pages/output.js';
+import { renderDeployPage, destroyDeployPage } from './pages/deploy.js';
 import { renderAgentPage, destroyAgentPage } from './pages/agent.js';
 
 const app = document.getElementById('app');
@@ -17,6 +19,17 @@ const app = document.getElementById('app');
 
 function renderApp() {
   const state = store.get();
+  const isQvdMode = state.uploadMode === 'qvd';
+  const canBusiness = isQvdMode ? !!state.qvdInspection : false;
+  const canInspect = isQvdMode ? !!state.qvdSchemaSuggestion : !!state.filename;
+  const qvdHasDdl = !!state.qvdDdlGeneration?.generated;
+  const qvdHasLoadScripts = Object.values(state.qvdDatabricksLoadScripts || {}).some(result => result?.generated);
+  const qvdHasPackage = Object.values(state.qvdMigrationPackages || {}).some(result => result?.generated);
+  const canReview = isQvdMode ? qvdHasDdl : !!state.filename;
+  const canOutput = isQvdMode ? qvdHasLoadScripts : !!state.regeneratedSql;
+  const activeName = isQvdMode
+    ? `${state.qvdInspection?.uploaded_files?.length || 0} QVD file${(state.qvdInspection?.uploaded_files?.length || 0) === 1 ? '' : 's'}`
+    : state.filename;
 
   app.innerHTML = `
     <!-- Navigation Bar -->
@@ -32,35 +45,50 @@ function renderApp() {
       <div class="navbar-nav">
         <a class="nav-step ${state.currentPage === 'upload' ? 'active' : ''}" data-page="upload" id="nav-upload">
           <span class="nav-step-number">1</span>
-          Upload & Analyze
+          ${isQvdMode ? 'QVD Upload' : 'Upload & Analyze'}
         </a>
         <div class="nav-divider"></div>
-        <a class="nav-step ${state.currentPage === 'inspect' ? 'active' : ''} ${!state.filename ? 'disabled' : ''}" data-page="inspect" id="nav-inspect">
-          <span class="nav-step-number">2</span>
-          Inspect Data
+        ${isQvdMode ? `
+          <a class="nav-step ${state.currentPage === 'business' ? 'active' : ''} ${!canBusiness ? 'disabled' : ''}" data-page="business" id="nav-business">
+            <span class="nav-step-number">2</span>
+            Business Analysis
+          </a>
+          <div class="nav-divider"></div>
+        ` : ''}
+        <a class="nav-step ${state.currentPage === 'inspect' ? 'active' : ''} ${!canInspect ? 'disabled' : ''}" data-page="inspect" id="nav-inspect">
+          <span class="nav-step-number">${isQvdMode ? '3' : '2'}</span>
+          ${isQvdMode ? 'Inspect Mapping' : 'Inspect Data'}
         </a>
         <div class="nav-divider"></div>
-        <a class="nav-step ${state.currentPage === 'review' ? 'active' : ''} ${!state.filename ? 'disabled' : ''}" data-page="review" id="nav-review">
-          <span class="nav-step-number">3</span>
-          Review & Edit
+        <a class="nav-step ${state.currentPage === 'review' ? 'active' : ''} ${!canReview ? 'disabled' : ''}" data-page="review" id="nav-review">
+          <span class="nav-step-number">${isQvdMode ? '4' : '3'}</span>
+          ${isQvdMode ? 'Next Step' : 'Review & Edit'}
         </a>
         <div class="nav-divider"></div>
-        <a class="nav-step ${state.currentPage === 'output' ? 'active' : ''} ${!state.regeneratedSql ? 'disabled' : ''}" data-page="output" id="nav-output">
-          <span class="nav-step-number">4</span>
+        <a class="nav-step ${state.currentPage === 'output' ? 'active' : ''} ${!canOutput ? 'disabled' : ''}" data-page="output" id="nav-output">
+          <span class="nav-step-number">${isQvdMode ? '5' : '4'}</span>
           Output
         </a>
-        <div class="nav-divider"></div>
-        <a class="nav-step ${state.currentPage === 'agent' ? 'active' : ''} ${!state.regeneratedSql ? 'disabled' : ''}" data-page="agent" id="nav-agent">
-          <span class="nav-step-number">5</span>
-          dbt Agent
-        </a>
+        ${isQvdMode ? `
+          <div class="nav-divider"></div>
+          <a class="nav-step ${state.currentPage === 'deploy' ? 'active' : ''} ${!qvdHasPackage ? 'disabled' : ''}" data-page="deploy" id="nav-deploy">
+            <span class="nav-step-number">6</span>
+            Databricks Deployment
+          </a>
+        ` : `
+          <div class="nav-divider"></div>
+          <a class="nav-step ${state.currentPage === 'agent' ? 'active' : ''} ${!canOutput ? 'disabled' : ''}" data-page="agent" id="nav-agent">
+            <span class="nav-step-number">5</span>
+            dbt Agent
+          </a>
+        `}
       </div>
 
       <div class="navbar-actions">
-        ${state.filename ? `
+        ${activeName ? `
           <span style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:6px">
             <span style="color:var(--success)">●</span>
-            ${state.filename}
+            ${activeName}
           </span>
         ` : ''}
       </div>
@@ -73,13 +101,21 @@ function renderApp() {
     <div class="status-bar">
       <div class="status-bar-left">
         <div class="status-indicator">
-          <div class="status-dot ${state.filename ? '' : 'warning'}"></div>
-          <span>${state.filename ? 'Connected' : 'Ready'}</span>
+          <div class="status-dot ${activeName ? '' : 'warning'}"></div>
+          <span>${activeName ? 'Connected' : 'Ready'}</span>
         </div>
         ${state.sessionId ? `<span>Session: ${state.sessionId.substring(0, 8)}…</span>` : ''}
       </div>
       <div class="status-bar-right">
         ${(() => {
+          if (isQvdMode) {
+            const qvdTables = state.qvdInspection?.tables?.length || 0;
+            const qvdFiles = state.qvdInspection?.uploaded_files?.length || 0;
+            return `
+              <span>${qvdTables} QVD table${qvdTables !== 1 ? 's' : ''}</span>
+              <span>${qvdFiles} file${qvdFiles !== 1 ? 's' : ''}</span>
+            `;
+          }
           const tableCount = state.graph && state.graph.nodes
             ? state.graph.nodes.filter(n => n.type !== 'external_file').length
             : (state.tables ? state.tables.length : 0);
@@ -107,14 +143,19 @@ function renderApp() {
 function renderCurrentPage(container, page) {
   // Destroy previous page components
   destroyUploadPage();
+  destroyBusinessPage();
   destroyInspectPage();
   destroyReviewPage();
   destroyOutputPage();
+  destroyDeployPage();
   destroyAgentPage();
 
   switch (page) {
     case 'upload':
       renderUploadPage(container);
+      break;
+    case 'business':
+      renderBusinessPage(container);
       break;
     case 'inspect':
       renderInspectPage(container);
@@ -124,6 +165,9 @@ function renderCurrentPage(container, page) {
       break;
     case 'output':
       renderOutputPage(container);
+      break;
+    case 'deploy':
+      renderDeployPage(container);
       break;
     case 'agent':
       renderAgentPage(container);
@@ -155,7 +199,7 @@ store.subscribe((state) => {
 
 window.addEventListener('hashchange', () => {
   const hash = window.location.hash.slice(1);
-  if (['upload', 'inspect', 'review', 'output', 'agent'].includes(hash)) {
+  if (['upload', 'business', 'inspect', 'review', 'output', 'deploy', 'agent'].includes(hash)) {
     const state = store.get();
     if (state.currentPage !== hash) {
       store.set({ currentPage: hash });

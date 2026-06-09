@@ -1,4 +1,5 @@
 import { store } from '../store.js';
+import { renderQvdMappingReview, setupQvdMappingReview } from '../components/qvdMappingReview.js';
 import { escapeHtml } from '../utils.js';
 
 let activeFileId = null;
@@ -15,6 +16,12 @@ const tabs = [
 
 export function renderInspectPage(container) {
   const state = store.get();
+  if (state.uploadMode === 'qvd') {
+    container.innerHTML = renderQvdMappingReview(state);
+    setupQvdMappingReview();
+    return;
+  }
+
   const files = state.sessionStats?.files || [];
 
   if (!state.sessionId || files.length === 0) {

@@ -16,8 +16,17 @@ from backend.session_cache import SessionPlanCache
 from backend.cost_tracker import CostTracker
 from backend.feedback_routes import ensure_feedback_table, register_feedback_routes
 from backend.migration.validator import validate_migration_sql, needs_repair, issues_to_strings
+from backend.storage_config import (
+    ARTIFACT_FOLDER,
+    DATA_ROOT,
+    UPLOAD_FOLDER,
+    ensure_directories,
+    file_download_metadata,
+    relative_artifact_path,
+    safe_join,
+)
 # pyrefly: ignore [missing-import]
-from flask import Flask, request, jsonify, send_from_directory, Response, stream_with_context
+from flask import Flask, request, jsonify, send_from_directory, send_file, Response, stream_with_context
 from flask_cors import CORS
 # pyrefly: ignore [missing-import]
 from werkzeug.utils import secure_filename
@@ -30,6 +39,7 @@ from backend.integrations.openrouter_client import (
     call_openrouter_chat_stream,
 )
 from backend.integrations.dbt_routes import register_dbt_agent_routes
+from backend.integrations.qvd_routes import register_qvd_routes
 from backend.extraction.qvf_runtime import attach_inline_samples_to_tables, build_graph_json, extract_model_from_script, extract_qvf, generate_description_rule_based, parse_sql_sections, prepare_script_for_migration
 from backend.extraction.comprehensive_qvf_extractor import enhance_metadata_with_comprehensive_extraction
 from backend.migration.sql_generation import (
@@ -74,8 +84,65 @@ app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='')
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB limit
 
+
+def _storage_metadata_for_value(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        candidate = value if os.path.isabs(value) else safe_join(DATA_ROOT, value)
+        relative = relative_artifact_path(candidate)
+    except (OSError, ValueError):
+        return None
+    if not os.path.isfile(candidate):
+        return None
+    metadata = file_download_metadata(candidate)
+    return relative, metadata
+
+
+def _publicize_storage_paths(value, downloads, key_name=None):
+    if key_name == 'data_root':
+        return value
+    if isinstance(value, dict):
+        return {key: _publicize_storage_paths(item, downloads, key) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_publicize_storage_paths(item, downloads) for item in value]
+    metadata = _storage_metadata_for_value(value)
+    if metadata:
+        relative, file_info = metadata
+        downloads[relative] = file_info
+        return relative
+    if isinstance(value, str) and os.path.isabs(value):
+        try:
+            return relative_artifact_path(value)
+        except (OSError, ValueError):
+            return value
+    return value
+
+
+@app.after_request
+def add_generated_file_download_metadata(response):
+    if not response.is_json:
+        return response
+    payload = response.get_json(silent=True)
+    if not isinstance(payload, (dict, list)):
+        return response
+    downloads = {}
+    public_payload = _publicize_storage_paths(payload, downloads)
+    if isinstance(public_payload, dict) and downloads:
+        existing = public_payload.get('file_downloads')
+        if isinstance(existing, list):
+            seen = {item.get('relative_path') for item in existing if isinstance(item, dict)}
+            public_payload['file_downloads'] = existing + [
+                item for relative, item in sorted(downloads.items()) if relative not in seen
+            ]
+        else:
+            public_payload['file_downloads'] = [item for _, item in sorted(downloads.items())]
+    response.set_data(json.dumps(public_payload))
+    response.content_type = 'application/json'
+    return response
+
+
 # Configuration
-UPLOAD_FOLDER = os.path.join(PROJECT_ROOT, 'uploads')
 DB_PATH = os.path.join(PROJECT_ROOT, 'qvf_decoder.db')
 
 def clear_upload_folder():
@@ -115,8 +182,7 @@ def clear_upload_folder():
     if skipped:
         print(f"INFO: {skipped} upload item(s) could not be deleted (likely locked by OneDrive sync — safe to ignore)")
 
-# Create and clean upload folder
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+ensure_directories()
 # clear_upload_folder() # Disabled for debugging
 
 ALLOWED_EXTENSIONS = {'qvf'}
@@ -2060,7 +2126,7 @@ def reset_db():
     db.close()
     init_db()
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+ensure_directories()
 
 # ... [rest of database setup and extraction remains same, skipping for brevity in this replace but I'll ensure all essential logic is preserved] ...
 
@@ -2325,6 +2391,7 @@ def build_session_bundle(session_id):
 
 register_dbt_agent_routes(app, get_db, build_session_bundle, UPLOAD_FOLDER, call_ai=call_openrouter)
 register_feedback_routes(app, get_db, call_ai=call_openrouter)
+register_qvd_routes(app, UPLOAD_FOLDER, call_ai=call_openrouter if _has_ai_provider_configured() else None)
 
 
 def serialize_regeneration_payload(row):
@@ -3007,14 +3074,16 @@ def upload_file():
     session_id = request.form.get('session_id') or str(uuid.uuid4())
     file_id = str(uuid.uuid4())
     filename = secure_filename(file.filename)
-    filepath = os.path.join(UPLOAD_FOLDER, f"{file_id}_{filename}")
+    session_upload_dir = safe_join(UPLOAD_FOLDER, session_id)
+    os.makedirs(session_upload_dir, exist_ok=True)
+    filepath = safe_join(session_upload_dir, f"{file_id}_{filename}")
     file.save(filepath)
-    extract_dir = os.path.join(UPLOAD_FOLDER, f"{file_id}_extracted")
+    extract_dir = safe_join(session_upload_dir, f"{file_id}_extracted")
     os.makedirs(extract_dir, exist_ok=True)
     try:
         # Handle ZIP of QVFs or single QVF
         if filename.lower().endswith('.zip'):
-            temp_zip_dir = os.path.join(UPLOAD_FOLDER, f"{file_id}_zip_temp")
+            temp_zip_dir = safe_join(session_upload_dir, f"{file_id}_zip_temp")
             os.makedirs(temp_zip_dir, exist_ok=True)
             with zipfile.ZipFile(filepath, 'r') as zf:
                 zf.extractall(temp_zip_dir)
@@ -3027,7 +3096,7 @@ def upload_file():
                         sub_file_id = str(uuid.uuid4())
                         sub_filename = f
                         sub_filepath = os.path.join(root, f)
-                        sub_extract_dir = os.path.join(UPLOAD_FOLDER, f"{sub_file_id}_extracted")
+                        sub_extract_dir = safe_join(session_upload_dir, f"{sub_file_id}_extracted")
                         os.makedirs(sub_extract_dir, exist_ok=True)
                         sub_data = extract_qvf(sub_filepath, sub_extract_dir)
                         process_single_qvf(session_id, sub_file_id, sub_filename, sub_filepath, sub_data)
@@ -3828,6 +3897,27 @@ def reset_all():
     clear_upload_folder()
     return jsonify({'success': True})
 
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({
+        'status': 'ok',
+        'data_root': DATA_ROOT,
+        'upload_folder_exists': os.path.isdir(UPLOAD_FOLDER),
+        'artifact_folder_exists': os.path.isdir(ARTIFACT_FOLDER),
+    })
+
+
+@app.route('/api/files/<path:relative_path>', methods=['GET'])
+def download_generated_file(relative_path):
+    try:
+        file_path = safe_join(DATA_ROOT, relative_path)
+    except ValueError:
+        return jsonify({'error': 'Invalid file path.'}), 400
+    if not os.path.isfile(file_path):
+        return jsonify({'error': 'File not found.'}), 404
+    return send_file(file_path, as_attachment=True, download_name=os.path.basename(file_path))
+
 @app.route('/api/export-validation-artifacts', methods=['POST'])
 def export_validation_artifacts_route():
     payload = request.get_json(silent=True) or {}
@@ -3953,7 +4043,7 @@ def download_validation_artifacts(zip_file_name):
     safe_name = os.path.basename(str(zip_file_name or '').replace('\\', '/'))
     if safe_name != zip_file_name or not safe_name.endswith('.zip'):
         return jsonify({'status': 'error', 'error': 'Invalid zip file name'}), 400
-    root = os.path.abspath(os.path.join(PROJECT_ROOT, 'generated_artifacts'))
+    root = os.path.abspath(ARTIFACT_FOLDER)
     target = os.path.abspath(os.path.join(root, safe_name))
     if os.path.commonpath([root, target]) != root or not os.path.exists(target):
         return jsonify({'status': 'error', 'error': 'Zip file not found'}), 404

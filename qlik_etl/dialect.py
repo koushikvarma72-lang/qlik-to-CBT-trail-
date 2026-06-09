@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from .function_mappings import FUNCTION_MAPPINGS
 from .errors import QlikTransformationError

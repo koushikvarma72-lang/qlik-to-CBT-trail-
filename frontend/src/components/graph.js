@@ -309,7 +309,6 @@ export class GraphComponent {
         input.on('change', (event) => {
           const file = event.target.files[0];
           if (file) {
-            console.log('📁 File selected for node:', d.name);
             if (window.handleGraphUpload) {
               window.handleGraphUpload(file);
             }
